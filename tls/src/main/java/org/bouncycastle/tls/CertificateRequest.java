@@ -125,7 +125,7 @@ public class CertificateRequest
     }
 
     /**
-     * @return an optional {@link Vector} of {@link SignatureAndHashAlgorithm}. May be non-null from
+     * @return an optional {@link Vector} of {@link SignatureAndHashAlgorithm}. May be non-null from
      *         TLS 1.3 onwards.
      */
     public Vector getSupportedSignatureAlgorithmsCert()

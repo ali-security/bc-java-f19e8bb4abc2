@@ -1,0 +1,64 @@
+name: seal-build
+
+# Build-and-pack only: the test suite runs on Travis (.travis.yml).
+# Mirrors BC's release flow for the public bcpkix-jdk15on-1.68.jar: build15+ (Ant 1.6.5 on
+# JDK 8u275, -source/-target 1.5), then add_module.sh pkix, which wraps the jar with bnd
+# (bnd.sh, OSGi headers) and adds the JDK 9 module-info under META-INF/versions/9.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install JDK 8u275, JDK 9+181, JDK 11.0.11 and Ant 1.6.5
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /opt/java
+          sudo chown "$(id -u):$(id -g)" /opt/java
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o jdk8.tgz https://github.com/AdoptOpenJDK/openjdk8-binaries/releases/download/jdk8u275-b01/OpenJDK8U-jdk_x64_linux_hotspot_8u275b01.tar.gz
+          mkdir -p /opt/java/jdk8u275-b01 && tar -xzf jdk8.tgz -C /opt/java/jdk8u275-b01 --strip-components=1
+          curl -fsSL -o jdk9.tgz "https://github.com/AdoptOpenJDK/openjdk9-binaries/releases/download/jdk-9%2B181/OpenJDK9U-jdk_x64_linux_hotspot_9_181.tar.gz"
+          mkdir -p /opt/java/jdk-9+181 && tar -xzf jdk9.tgz -C /opt/java/jdk-9+181 --strip-components=2
+          curl -fsSL -o jdk11.tgz "https://github.com/AdoptOpenJDK/openjdk11-binaries/releases/download/jdk-11.0.11%2B9/OpenJDK11U-jdk_x64_linux_hotspot_11.0.11_9.tar.gz"
+          mkdir -p /opt/java/jdk-11.0.11+9 && tar -xzf jdk11.tgz -C /opt/java/jdk-11.0.11+9 --strip-components=1
+          curl -fsSL -o ant.tgz https://archive.apache.org/dist/ant/binaries/apache-ant-1.6.5-bin.tar.gz
+          tar -xzf ant.tgz
+          echo "ANT_HOME=$RUNNER_TEMP/apache-ant-1.6.5" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/apache-ant-1.6.5/bin" >> "$GITHUB_PATH"
+          /opt/java/jdk8u275-b01/bin/java -version
+          /opt/java/jdk-9+181/bin/java -version
+          /opt/java/jdk-11.0.11+9/bin/java -version
+
+      - name: Build jars (build15+)
+        env:
+          ANT_OPTS: -Xmx2g
+        run: |
+          set -euo pipefail
+          ant -version
+          JDKPATH=/opt/java/jdk8u275-b01 sh ./build15+
+          ls -la build/artifacts/jdk1.5/jars/
+
+      - name: OSGi bundle + JDK 9 module (add_module.sh pkix)
+        run: |
+          set -euo pipefail
+          sh ./add_module.sh pkix
+          JAR=build/artifacts/jdk1.5/jars/bcpkix-jdk15on-168.jar
+          unzip -p "$JAR" META-INF/MANIFEST.MF | grep -E "^(Bundle-SymbolicName|Bundle-Version|Export-Package|Import-Package|Automatic-Module-Name|Multi-Release|Implementation-Version):"
+          for h in Bundle-SymbolicName Export-Package Import-Package; do
+            unzip -p "$JAR" META-INF/MANIFEST.MF | grep -q "^$h: " || { echo "missing OSGi header $h"; exit 1; }
+          done
+          unzip -l "$JAR" | grep -E "module-info|MANIFEST"
+          mkdir -p seal-out
+          cp "$JAR" seal-out/bcpkix-jdk15on-1.68.jar
+          unzip -l seal-out/bcpkix-jdk15on-1.68.jar | tail -1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bcpkix-jdk15on-1.68
+          path: seal-out/bcpkix-jdk15on-1.68.jar
+          if-no-files-found: error

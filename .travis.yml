@@ -1,3 +1,37 @@
-language: java
-jdk:
-  - openjdk8
+language: shell
+dist: jammy
+
+# The project ships build.gradle in Gradle 4-6 syntax (testCompile) and no wrapper, so a
+# current image's JDK/Gradle cannot run it; install AdoptOpenJDK 8u275 (the JDK the public
+# jars record in Originally-Created-By) + Gradle 6.9.4 explicitly and run the project's own
+# test definition (each subproject's `AllTest*` filter), one module group per job.
+# bcpkix depends on core and prov, so their suites run alongside pkix; tls/mail/pg/test
+# complete the upstream `test.dependsOn` list.
+env:
+  jobs:
+    - TEST_TASKS=":pkix:test"
+    - TEST_TASKS=":core:test"
+    - TEST_TASKS=":prov:test"
+    - TEST_TASKS=":tls:test"
+    - TEST_TASKS=":mail:test :pg:test :test:test"
+
+before_install:
+  - curl -fsSL -o /tmp/jdk8.tar.gz https://github.com/AdoptOpenJDK/openjdk8-binaries/releases/download/jdk8u275-b01/OpenJDK8U-jdk_x64_linux_hotspot_8u275b01.tar.gz
+  - mkdir -p $HOME/jdk8 && tar -xzf /tmp/jdk8.tar.gz -C $HOME/jdk8 --strip-components=1
+  - export JAVA_HOME=$HOME/jdk8
+  - curl -fsSL -o /tmp/gradle.zip https://services.gradle.org/distributions/gradle-6.9.4-bin.zip
+  - unzip -q /tmp/gradle.zip -d $HOME
+  - export PATH=$JAVA_HOME/bin:$HOME/gradle-6.9.4/bin:$PATH
+  - java -version
+  - gradle --version
+
+install: true
+
+before_script:
+  - (while sleep 240; do echo "keepalive - tests still running"; done) &
+
+script:
+  - gradle --no-daemon --console=plain -s --continue --init-script .travis/seal-test-logging.gradle $TEST_TASKS
+
+after_script:
+  - sh .travis/wait-for-log.sh gradle 1800

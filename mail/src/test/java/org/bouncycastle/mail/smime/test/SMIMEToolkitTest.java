@@ -44,6 +44,7 @@ import org.bouncycastle.mail.smime.SMIMEException;
 import org.bouncycastle.mail.smime.SMIMESigned;
 import org.bouncycastle.mail.smime.SMIMESignedGenerator;
 import org.bouncycastle.mail.smime.SMIMEToolkit;
+import org.bouncycastle.openssl.jcajce.JcaPEMKeyConverter;
 import org.bouncycastle.openssl.jcajce.JcaPKIXIdentityBuilder;
 import org.bouncycastle.operator.OperatorCreationException;
 import org.bouncycastle.operator.bc.BcDigestCalculatorProvider;
@@ -261,12 +262,15 @@ public class SMIMEToolkitTest
 
         MimeBodyPart res = gen.generateEncapsulated(msg);
 
-        Assert.assertTrue(toolkit.isValidSignature(res, new JcaSimpleSignerInfoVerifierBuilder().setProvider(BC).build(identity.getCertificate())));
+        // smimeTKcert.pem expired 2025-01-08; verify against the public key (upstream 04555bfc)
+        JcaPEMKeyConverter keyConverter = new JcaPEMKeyConverter().setProvider(BC);
+
+        Assert.assertTrue(toolkit.isValidSignature(res, new JcaSimpleSignerInfoVerifierBuilder().setProvider(BC).build(keyConverter.getPublicKey(identity.getCertificate().getSubjectPublicKeyInfo()))));
 
         MimeMessage body = makeMimeMessage(res);
 
-        Assert.assertTrue(toolkit.isValidSignature(body, new JcaSimpleSignerInfoVerifierBuilder().setProvider(BC).build(identity.getCertificate())));
-        Assert.assertTrue(toolkit.isValidSignature(body, new JcaSimpleSignerInfoVerifierBuilder().setProvider(BC).build(identity.getX509Certificate())));
+        Assert.assertTrue(toolkit.isValidSignature(body, new JcaSimpleSignerInfoVerifierBuilder().setProvider(BC).build(keyConverter.getPublicKey(identity.getCertificate().getSubjectPublicKeyInfo()))));
+        Assert.assertTrue(toolkit.isValidSignature(body, new JcaSimpleSignerInfoVerifierBuilder().setProvider(BC).build(identity.getX509Certificate().getPublicKey())));
     }
 
     public void testEncryptedMimeBodyPart()

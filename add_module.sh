@@ -1,6 +1,6 @@
-export JAVA_9=/usr/lib/jvm/java-9-oracle
-export JAVA_11=/usr/lib/jvm/java-11-openjdk-amd64
-export JAVA_15=/opt/jdk-15
+export JAVA_9=/opt/java/jdk-9+181
+export JAVA_11=/opt/java/jdk-11.0.11+9
+export JAVA_15=/opt/java/jdk-15.0.2+7
 
 export JAVA_HOME=$JAVA_9
 export PATH=$JAVA_HOME/bin:$PATH
@@ -30,19 +30,19 @@ rm -rf module.tmp
     pkixJar=`echo build/artifacts/jdk1.5/jars/bcpkix-jdk15on*.jar`
     if [ $1 = "prov" ]
     then
-	javac -target 1.9 -classpath module.tmp/v5 -d module.tmp/v9 `find $1/src/main/jdk1.9 -name "*.java"` -sourcepath $1/src/main/jdk1.9:$1/src/main/java:core/src/main/java
-	$JAVA_11/bin/javac -classpath module.tmp/v5 -d module.tmp/v11 `find $1/src/main/jdk1.11 -name "*.java"` -sourcepath $1/src/main/jdk1.11:$1/src/main/java:core/src/main/java
-	$JAVA_15/bin/javac -classpath module.tmp/v5:mofule.tmp/v11 -d module.tmp/v15 `find prov/src/main/jdk1.15 -name "*.java"` -sourcepath prov/src/main/jdk1.15:prov/src/main/jdk1.11:prov/src/main/java:core/src/main/java
+	javac -encoding UTF-8  -target 1.9 -classpath module.tmp/v5 -d module.tmp/v9 `find $1/src/main/jdk1.9 -name "*.java"` -sourcepath $1/src/main/jdk1.9:$1/src/main/java:core/src/main/java
+	$JAVA_11/bin/javac -encoding UTF-8 -classpath module.tmp/v5 -d module.tmp/v11 `find $1/src/main/jdk1.11 -name "*.java"` -sourcepath $1/src/main/jdk1.11:$1/src/main/java:core/src/main/java
+	$JAVA_15/bin/javac -encoding UTF-8 -classpath module.tmp/v5:mofule.tmp/v11 -d module.tmp/v15 `find prov/src/main/jdk1.15 -name "*.java"` -sourcepath prov/src/main/jdk1.15:prov/src/main/jdk1.11:prov/src/main/java:core/src/main/java
     elif [ $1 = "prov-ext" ]
     then
-	javac -target 1.9 -classpath module.tmp/v5 -d module.tmp/v9 `find prov/src/main/ext-jdk1.9 -name "*.java"` -sourcepath prov/src/main/ext-jdk1.9:prov/src/main/java:core/src/main/java
-	$JAVA_11/bin/javac -classpath module.tmp/v5 -d module.tmp/v11 `find prov/src/main/jdk1.11 -name "*.java"` -sourcepath prov/src/main/jdk1.11:prov/src/main/java:core/src/main/java
-	$JAVA_15/bin/javac -classpath module.tmp/v5:mofule.tmp/v11 -d module.tmp/v15 `find prov/src/main/jdk1.15 -name "*.java"` -sourcepath prov/src/main/jdk1.15:prov/src/main/jdk1.11:prov/src/main/java:core/src/main/java
+	javac -encoding UTF-8 -target 1.9 -classpath module.tmp/v5 -d module.tmp/v9 `find prov/src/main/ext-jdk1.9 -name "*.java"` -sourcepath prov/src/main/ext-jdk1.9:prov/src/main/java:core/src/main/java
+	$JAVA_11/bin/javac -encoding UTF-8 -classpath module.tmp/v5 -d module.tmp/v11 `find prov/src/main/jdk1.11 -name "*.java"` -sourcepath prov/src/main/jdk1.11:prov/src/main/java:core/src/main/java
+	$JAVA_15/bin/javac -encoding UTF-8 -classpath module.tmp/v5:mofule.tmp/v11 -d module.tmp/v15 `find prov/src/main/jdk1.15 -name "*.java"` -sourcepath prov/src/main/jdk1.15:prov/src/main/jdk1.11:prov/src/main/java:core/src/main/java
     elif [ $1 = "mail" ]
     then
-	javac  -target 1.9 --module-path ${provJar}:$pkixJar -classpath module.tmp/v5 -d module.tmp/v9 `find $1/src/main/jdk1.9 -name "*.java"` -sourcepath $1/src/main/jdk1.9:$1/src/main/java
+	javac -encoding UTF-8 -target 1.9 --module-path ${provJar}:$pkixJar -classpath module.tmp/v5 -d module.tmp/v9 `find $1/src/main/jdk1.9 -name "*.java"` -sourcepath $1/src/main/jdk1.9:$1/src/main/java
     else
-	javac  -target 1.9 --module-path $provJar -classpath module.tmp/v5 -d module.tmp/v9 `find $1/src/main/jdk1.9 -name "*.java"` -sourcepath $1/src/main/jdk1.9:$1/src/main/java
+	javac -encoding UTF-8 -target 1.9 --module-path $provJar -classpath module.tmp/v5 -d module.tmp/v9 `find $1/src/main/jdk1.9 -name "*.java"` -sourcepath $1/src/main/jdk1.9:$1/src/main/java
     fi
 )
 # Java 11 Step
@@ -90,5 +90,5 @@ cp build/artifacts/jdk1.5/jars/$jarName module.tmp/$jarName
 )
 cp module.tmp/$jarName build/artifacts/jdk1.5/jars/$jarName
 
-bcsign-oracle build/artifacts/jdk1.5/jars/$jarName
+# bcsign-oracle build/artifacts/jdk1.5/jars/$jarName
 done

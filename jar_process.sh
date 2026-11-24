@@ -1,4 +1,4 @@
-export JAVA_HOME=/usr/lib/jvm/java-9-oracle
+export JAVA_HOME=/opt/java/jdk-9+181
 export PATH=$JAVA_HOME/bin:$PATH
 
 sh add_module.sh prov
