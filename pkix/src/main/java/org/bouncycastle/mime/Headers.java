@@ -55,28 +55,32 @@ public class Headers
     {
         this.headersAsPresented = headerLines;
 
-        String header = "";
+        // a builder: concatenation copied the header so far per continuation line, quadratic in its length
+        StringBuilder header = new StringBuilder();
         for (Iterator it = headerLines.iterator(); it.hasNext();)
         {
             String line = (String)it.next();
             if (line.startsWith(" ") || line.startsWith("\t"))
             {
-                header = header + line.trim();
+                header.append(line.trim());
             }
             else
             {
                 if (header.length() != 0)
                 {
-                    this.put(header.substring(0, header.indexOf(':')).trim(), header.substring(header.indexOf(':') + 1).trim());
+                    String completeHeader = header.toString();
+                    this.put(completeHeader.substring(0, completeHeader.indexOf(':')).trim(), completeHeader.substring(completeHeader.indexOf(':') + 1).trim());
                 }
-                header = line;
+                header.setLength(0);
+                header.append(line);
             }
         }
 
         // pick up last header line
-        if (header.trim().length() != 0)
+        String lastHeader = header.toString();
+        if (lastHeader.trim().length() != 0)
         {
-            this.put(header.substring(0, header.indexOf(':')).trim(), header.substring(header.indexOf(':') + 1).trim());
+            this.put(lastHeader.substring(0, lastHeader.indexOf(':')).trim(), lastHeader.substring(lastHeader.indexOf(':') + 1).trim());
         }
 
         String contentTypeHeader = (this.getValues("Content-Type") == null) ? "text/plain" : this.getValues("Content-Type")[0];
