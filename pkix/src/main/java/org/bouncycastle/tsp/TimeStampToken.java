@@ -5,9 +5,14 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.util.Collection;
 import java.util.Date;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.Set;
 
 import org.bouncycastle.asn1.ASN1Encoding;
+import org.bouncycastle.asn1.ASN1ObjectIdentifier;
 import org.bouncycastle.asn1.ASN1Primitive;
+import org.bouncycastle.asn1.cmp.PKIFailureInfo;
 import org.bouncycastle.asn1.cms.Attribute;
 import org.bouncycastle.asn1.cms.AttributeTable;
 import org.bouncycastle.asn1.cms.CMSAttributes;
@@ -34,11 +39,13 @@ import org.bouncycastle.cms.CMSSignedData;
 import org.bouncycastle.cms.SignerId;
 import org.bouncycastle.cms.SignerInformation;
 import org.bouncycastle.cms.SignerInformationVerifier;
+import org.bouncycastle.operator.DefaultDigestAlgorithmIdentifierFinder;
 import org.bouncycastle.operator.DigestCalculator;
 import org.bouncycastle.operator.OperatorCreationException;
 import org.bouncycastle.util.Arrays;
 import org.bouncycastle.util.Properties;
 import org.bouncycastle.util.Store;
+import org.bouncycastle.util.Strings;
 
 /**
  * Carrier class for a TimeStampToken.
@@ -60,7 +67,15 @@ public class TimeStampToken
      */
     private static final String TSP_ALLOW_INCONSISTENT_SIGNING_TIME = "org.bouncycastle.tsp.allow_inconsistent_signing_time";
 
+    /**
+     * The hash algorithms {@link #validate(SignerInformationVerifier)} accepts for a token's message
+     * imprint, as a comma separated list of digest names or dotted OIDs (for example "SHA-256,SHA-384,SHA-512").
+     * If not set, {@link TSPAlgorithms#ALLOWED} is used. Read via {@link Properties#asKeySet(String)}.
+     */
+    private static final String TSP_ALLOWED_IMPRINT_ALGORITHMS = "org.bouncycastle.tsp.allowed_imprint_algorithms";
+
     private static final long SIGNING_TIME_ALLOWANCE = 60 * 1000L;
+    private static final DefaultDigestAlgorithmIdentifierFinder DIGEST_FINDER = new DefaultDigestAlgorithmIdentifierFinder();
 
     CMSSignedData tsToken;
 
@@ -234,11 +249,16 @@ public class TimeStampToken
      * timestamp was created.
      * </p>
      * <p>
+     * The message imprint must also use a hash algorithm in {@link TSPAlgorithms#ALLOWED}, or in the list
+     * given by the "org.bouncycastle.tsp.allowed_imprint_algorithms" property if it is set.
+     * </p>
+     * <p>
      * A successful call to validate means all the above are true.
      * </p>
      *
      * @param sigVerifier the content verifier create the objects required to verify the CMS object in the timestamp.
-     * @throws TSPException if an exception occurs in processing the token.
+     * @throws TSPException if an exception occurs in processing the token, or the imprint algorithm property
+     * names an unknown digest.
      * @throws TSPValidationException if the certificate or signature fail to be valid.
      * @throws IllegalArgumentException if the sigVerifierProvider has no associated certificate.
      */
@@ -246,6 +266,71 @@ public class TimeStampToken
         SignerInformationVerifier sigVerifier)
         throws TSPException, TSPValidationException
     {
+        validate(sigVerifier, getDefaultImprintAlgorithms());
+    }
+
+    private static Set getDefaultImprintAlgorithms()
+        throws TSPException
+    {
+        Set names = Properties.asKeySet(TSP_ALLOWED_IMPRINT_ALGORITHMS);
+        Set algorithms = new HashSet();
+
+        for (Iterator it = names.iterator(); it.hasNext();)
+        {
+            String name = (String)it.next();
+            if (name.length() != 0)
+            {
+                algorithms.add(findImprintAlgorithm(name));
+            }
+        }
+
+        return algorithms.isEmpty() ? TSPAlgorithms.ALLOWED : algorithms;
+    }
+
+    /**
+     * Resolve a digest name (case insensitive) or dotted OID from the allowed imprint algorithms property.
+     */
+    private static ASN1ObjectIdentifier findImprintAlgorithm(String name)
+        throws TSPException
+    {
+        ASN1ObjectIdentifier algorithm = DIGEST_FINDER.find(Strings.toUpperCase(name)).getAlgorithm();
+
+        if (algorithm == null)
+        {
+            try
+            {
+                algorithm = new ASN1ObjectIdentifier(name);
+            }
+            catch (IllegalArgumentException e)
+            {
+                throw new TSPException("unknown digest algorithm in " + TSP_ALLOWED_IMPRINT_ALGORITHMS + ": " + name, e);
+            }
+        }
+
+        return algorithm;
+    }
+
+    /**
+     * Validate the time stamp token, as for {@link #validate(SignerInformationVerifier)}, but accepting a
+     * message imprint calculated with any of the passed in hash algorithms.
+     *
+     * @param sigVerifier the content verifier create the objects required to verify the CMS object in the timestamp.
+     * @param allowedImprintAlgorithms the OIDs of the hash algorithms acceptable for the message imprint.
+     * @throws TSPException if an exception occurs in processing the token.
+     * @throws TSPValidationException if the imprint algorithm is not allowed (failure code badAlg), or the
+     * certificate or signature fail to be valid.
+     * @throws IllegalArgumentException if the sigVerifierProvider has no associated certificate.
+     */
+    public void validate(
+        SignerInformationVerifier sigVerifier,
+        Set allowedImprintAlgorithms)
+        throws TSPException, TSPValidationException
+    {
+        if (!allowedImprintAlgorithms.contains(tstInfo.getMessageImprintAlgOID()))
+        {
+            throw new TSPValidationException("message imprint algorithm not allowed.", PKIFailureInfo.badAlg);
+        }
+
         if (!sigVerifier.hasAssociatedCertificate())
         {
             throw new IllegalArgumentException("verifier provider needs an associated certificate");
