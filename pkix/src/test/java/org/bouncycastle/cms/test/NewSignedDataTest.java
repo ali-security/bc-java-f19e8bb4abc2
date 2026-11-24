@@ -2,6 +2,7 @@ package org.bouncycastle.cms.test;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.math.BigInteger;
 import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.MessageDigest;
@@ -13,6 +14,7 @@ import java.security.spec.PKCS8EncodedKeySpec;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -25,6 +27,7 @@ import junit.framework.Test;
 import junit.framework.TestCase;
 import junit.framework.TestSuite;
 import org.bouncycastle.asn1.ASN1ApplicationSpecific;
+import org.bouncycastle.asn1.ASN1Encodable;
 import org.bouncycastle.asn1.ASN1EncodableVector;
 import org.bouncycastle.asn1.ASN1Encoding;
 import org.bouncycastle.asn1.ASN1InputStream;
@@ -32,6 +35,7 @@ import org.bouncycastle.asn1.ASN1Integer;
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
 import org.bouncycastle.asn1.ASN1OctetString;
 import org.bouncycastle.asn1.ASN1Primitive;
+import org.bouncycastle.asn1.ASN1Set;
 import org.bouncycastle.asn1.DERNull;
 import org.bouncycastle.asn1.DEROctetString;
 import org.bouncycastle.asn1.DERSet;
@@ -40,13 +44,16 @@ import org.bouncycastle.asn1.cms.AttributeTable;
 import org.bouncycastle.asn1.cms.CMSAttributes;
 import org.bouncycastle.asn1.cms.CMSObjectIdentifiers;
 import org.bouncycastle.asn1.cms.ContentInfo;
+import org.bouncycastle.asn1.cms.IssuerAndSerialNumber;
 import org.bouncycastle.asn1.cms.SignedData;
+import org.bouncycastle.asn1.cms.SignerIdentifier;
 import org.bouncycastle.asn1.cms.SignerInfo;
 import org.bouncycastle.asn1.edec.EdECObjectIdentifiers;
 import org.bouncycastle.asn1.nist.NISTObjectIdentifiers;
 import org.bouncycastle.asn1.ocsp.OCSPResponse;
 import org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers;
 import org.bouncycastle.asn1.teletrust.TeleTrusTObjectIdentifiers;
+import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.asn1.x509.AlgorithmIdentifier;
 import org.bouncycastle.asn1.x9.X9ObjectIdentifiers;
 import org.bouncycastle.cert.X509AttributeCertificateHolder;
@@ -56,6 +63,7 @@ import org.bouncycastle.cert.jcajce.JcaCertStore;
 import org.bouncycastle.cert.jcajce.JcaX509CRLHolder;
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
 import org.bouncycastle.cert.jcajce.JcaX509CertificateHolder;
+import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder;
 import org.bouncycastle.cert.ocsp.OCSPResp;
 import org.bouncycastle.cms.CMSAbsentContent;
 import org.bouncycastle.cms.CMSAlgorithm;
@@ -618,6 +626,145 @@ public class NewSignedDataTest
         init();
 
         junit.textui.TestRunner.run(NewSignedDataTest.class);
+    }
+
+    private static SignerInfo unverifiedSignerInfo(X500Name issuer, BigInteger serial)
+    {
+        // the signature value is junk: the stores are built before anything is verified
+        return new SignerInfo(new SignerIdentifier(new IssuerAndSerialNumber(issuer, serial)),
+            new AlgorithmIdentifier(NISTObjectIdentifiers.id_sha256), (ASN1Set)null,
+            new AlgorithmIdentifier(PKCSObjectIdentifiers.rsaEncryption), new DEROctetString(new byte[64]), (ASN1Set)null);
+    }
+
+    private static byte[] unverifiedSignedData(ASN1Set certs, ASN1Set signerInfos)
+        throws IOException
+    {
+        SignedData sd = new SignedData(new DERSet(new AlgorithmIdentifier(NISTObjectIdentifiers.id_sha256)),
+            new ContentInfo(CMSObjectIdentifiers.data, new DEROctetString(new byte[]{ 'h', 'i' })), certs, null, signerInfos);
+        return new ContentInfo(CMSObjectIdentifiers.signedData, sd).getEncoded(ASN1Encoding.DER);
+    }
+
+    public void testReorderedIssuerNamesStayLinear()
+        throws Exception
+    {
+        int n = 20000;
+
+        // two signers whose issuers are the same name differently encoded: equal ids, one hash bucket
+        SignerInformationStore signers = new CMSSignedData(reorderedSignersMessage(n)).getSignerInfos();
+
+        assertEquals(2, signers.size());
+
+        // a lookup compares the issuer names themselves, so it is checked against a short name
+        SignerInformationStore shortSigners = new CMSSignedData(reorderedSignersMessage(8)).getSignerInfos();
+        assertEquals(2, shortSigners.getSigners(new SignerId(CMSTestUtil.makeLargeName(8, false), BigInteger.ONE)).size());
+
+        final byte[] smallSigners = reorderedSignersMessage(n / 8);
+        final byte[] largeSigners = reorderedSignersMessage(n);
+        CMSTestUtil.assertLinearGrowth("getSignerInfos", new CMSTestUtil.Timed()
+        {
+            public void run()
+                throws Exception
+            {
+                new CMSSignedData(smallSigners).getSignerInfos();
+            }
+        }, new CMSTestUtil.Timed()
+        {
+            public void run()
+                throws Exception
+            {
+                new CMSSignedData(largeSigners).getSignerInfos();
+            }
+        });
+
+        // one signer and one certificate whose issuer is the reordered form: the documented lookup
+        CMSSignedData shortLookup = reorderedLookupMessage(8, BigInteger.ONE);
+        assertEquals(1, shortLookup.getCertificates().getMatches(firstSignerId(shortLookup)).size());
+
+        // a certificate with another serial number is rejected before its issuer name is compared
+        final CMSSignedData smallLookup = reorderedLookupMessage(n / 8, BigInteger.valueOf(2));
+        final CMSSignedData largeLookup = reorderedLookupMessage(n, BigInteger.valueOf(2));
+        final SignerId smallSid = firstSignerId(smallLookup);
+        final SignerId largeSid = firstSignerId(largeLookup);
+
+        assertEquals(0, largeLookup.getCertificates().getMatches(largeSid).size());
+        CMSTestUtil.assertLinearGrowth("getMatches", new CMSTestUtil.Timed()
+        {
+            public void run()
+            {
+                smallLookup.getCertificates().getMatches(smallSid);
+            }
+        }, new CMSTestUtil.Timed()
+        {
+            public void run()
+            {
+                largeLookup.getCertificates().getMatches(largeSid);
+            }
+        });
+    }
+
+    private static byte[] reorderedSignersMessage(int n)
+        throws IOException
+    {
+        return unverifiedSignedData(null, new DERSet(new ASN1Encodable[]{
+            unverifiedSignerInfo(CMSTestUtil.makeLargeName(n, false), BigInteger.ONE),
+            unverifiedSignerInfo(CMSTestUtil.makeLargeName(n, true), BigInteger.ONE) }));
+    }
+
+    private static CMSSignedData reorderedLookupMessage(int n, BigInteger certSerial)
+        throws Exception
+    {
+        X509CertificateHolder cert = new JcaX509v3CertificateBuilder(CMSTestUtil.makeLargeName(n, true), certSerial,
+            new Date(System.currentTimeMillis() - 1000L), new Date(System.currentTimeMillis() + 86400000L),
+            new X500Name("CN=x"), _signKP.getPublic())
+            .build(new JcaContentSignerBuilder("SHA256withRSA").setProvider(BC).build(_signKP.getPrivate()));
+        return new CMSSignedData(unverifiedSignedData(new DERSet(cert.toASN1Structure()),
+            new DERSet(unverifiedSignerInfo(CMSTestUtil.makeLargeName(n, false), BigInteger.ONE))));
+    }
+
+    private static SignerId firstSignerId(CMSSignedData signedData)
+    {
+        return ((SignerInformation)signedData.getSignerInfos().getSigners().iterator().next()).getSID();
+    }
+
+    public void testCollidingSignerIdsStayLinear()
+        throws Exception
+    {
+        int k = 16000;
+        X500Name issuer = new X500Name("CN=x");
+        SignerInformationStore signers = new CMSSignedData(collidingSignersMessage(issuer, k)).getSignerInfos();
+
+        assertEquals(k, signers.size());
+        assertEquals(1, signers.getSigners(new SignerId(issuer, CMSTestUtil.collidingSerial(k))).size());
+        assertEquals(0, signers.getSigners(new SignerId(issuer, BigInteger.ONE)).size());
+
+        final byte[] small = collidingSignersMessage(issuer, k / 8);
+        final byte[] large = collidingSignersMessage(issuer, k);
+        CMSTestUtil.assertLinearGrowth("getSignerInfos", new CMSTestUtil.Timed()
+        {
+            public void run()
+                throws Exception
+            {
+                new CMSSignedData(small).getSignerInfos();
+            }
+        }, new CMSTestUtil.Timed()
+        {
+            public void run()
+                throws Exception
+            {
+                new CMSSignedData(large).getSignerInfos();
+            }
+        });
+    }
+
+    private static byte[] collidingSignersMessage(X500Name issuer, int k)
+        throws IOException
+    {
+        ASN1EncodableVector sis = new ASN1EncodableVector();
+        for (int i = 1; i <= k; i++)
+        {
+            sis.add(unverifiedSignerInfo(issuer, CMSTestUtil.collidingSerial(i)));
+        }
+        return unverifiedSignedData(null, new DERSet(sis));
     }
 
     public static Test suite() 

@@ -35,6 +35,7 @@ import junit.framework.Test;
 import junit.framework.TestCase;
 import junit.framework.TestSuite;
 import org.bouncycastle.asn1.ASN1EncodableVector;
+import org.bouncycastle.asn1.ASN1Encoding;
 import org.bouncycastle.asn1.ASN1InputStream;
 import org.bouncycastle.asn1.ASN1Integer;
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
@@ -49,11 +50,15 @@ import org.bouncycastle.asn1.DERUTF8String;
 import org.bouncycastle.asn1.cms.Attribute;
 import org.bouncycastle.asn1.cms.AttributeTable;
 import org.bouncycastle.asn1.cms.CCMParameters;
+import org.bouncycastle.asn1.cms.CMSObjectIdentifiers;
 import org.bouncycastle.asn1.cms.ContentInfo;
 import org.bouncycastle.asn1.cms.EncryptedContentInfo;
 import org.bouncycastle.asn1.cms.EnvelopedData;
 import org.bouncycastle.asn1.cms.GCMParameters;
+import org.bouncycastle.asn1.cms.IssuerAndSerialNumber;
+import org.bouncycastle.asn1.cms.KeyTransRecipientInfo;
 import org.bouncycastle.asn1.cms.PasswordRecipientInfo;
+import org.bouncycastle.asn1.cms.RecipientIdentifier;
 import org.bouncycastle.asn1.cms.RecipientInfo;
 import org.bouncycastle.asn1.cryptopro.CryptoProObjectIdentifiers;
 import org.bouncycastle.asn1.kisa.KISAObjectIdentifiers;
@@ -76,6 +81,7 @@ import org.bouncycastle.cms.CMSException;
 import org.bouncycastle.cms.CMSProcessableByteArray;
 import org.bouncycastle.cms.CMSTypedData;
 import org.bouncycastle.cms.KeyAgreeRecipientInformation;
+import org.bouncycastle.cms.KeyTransRecipientId;
 import org.bouncycastle.cms.KeyTransRecipientInformation;
 import org.bouncycastle.cms.OriginatorInfoGenerator;
 import org.bouncycastle.cms.OriginatorInformation;
@@ -608,6 +614,104 @@ public class NewEnvelopedDataTest
         throws Exception
     {
         junit.textui.TestRunner.run(NewEnvelopedDataTest.suite());
+    }
+
+    private static RecipientInfo unverifiedKeyTransRecipient(X500Name issuer, BigInteger serial)
+    {
+        return new RecipientInfo(new KeyTransRecipientInfo(new RecipientIdentifier(new IssuerAndSerialNumber(issuer, serial)),
+            new AlgorithmIdentifier(PKCSObjectIdentifiers.rsaEncryption, DERNull.INSTANCE), new DEROctetString(new byte[0])));
+    }
+
+    private static byte[] unverifiedEnvelopedData(ASN1EncodableVector recipientInfos)
+        throws IOException
+    {
+        EncryptedContentInfo eci = new EncryptedContentInfo(CMSObjectIdentifiers.data,
+            new AlgorithmIdentifier(NISTObjectIdentifiers.id_aes128_CBC, new DEROctetString(new byte[16])), new DEROctetString(new byte[16]));
+        return new ContentInfo(CMSObjectIdentifiers.envelopedData, new EnvelopedData(null, new DERSet(recipientInfos), eci, (ASN1Set)null))
+            .getEncoded(ASN1Encoding.DER);
+    }
+
+    public void testReorderedRecipientIssuersStayLinear()
+        throws Exception
+    {
+        int n = 20000;
+
+        // the recipient store is built by the constructor, before any key is looked for
+        RecipientInformationStore recipients = new CMSEnvelopedData(reorderedRecipientsMessage(n)).getRecipientInfos();
+
+        assertEquals(2, recipients.size());
+
+        // a lookup compares the issuer names themselves, so it is checked against a short name
+        RecipientInformationStore shortRecipients = new CMSEnvelopedData(reorderedRecipientsMessage(8)).getRecipientInfos();
+        assertEquals(2, shortRecipients.getRecipients(new KeyTransRecipientId(CMSTestUtil.makeLargeName(8, false), BigInteger.ONE)).size());
+
+        final byte[] small = reorderedRecipientsMessage(n / 8);
+        final byte[] large = reorderedRecipientsMessage(n);
+        CMSTestUtil.assertLinearGrowth("CMSEnvelopedData", new CMSTestUtil.Timed()
+        {
+            public void run()
+                throws Exception
+            {
+                new CMSEnvelopedData(small);
+            }
+        }, new CMSTestUtil.Timed()
+        {
+            public void run()
+                throws Exception
+            {
+                new CMSEnvelopedData(large);
+            }
+        });
+    }
+
+    private static byte[] reorderedRecipientsMessage(int n)
+        throws IOException
+    {
+        ASN1EncodableVector ris = new ASN1EncodableVector();
+        ris.add(unverifiedKeyTransRecipient(CMSTestUtil.makeLargeName(n, false), BigInteger.ONE));
+        ris.add(unverifiedKeyTransRecipient(CMSTestUtil.makeLargeName(n, true), BigInteger.ONE));
+        return unverifiedEnvelopedData(ris);
+    }
+
+    public void testCollidingRecipientIdsStayLinear()
+        throws Exception
+    {
+        int k = 16000;
+        X500Name issuer = new X500Name("CN=x");
+        RecipientInformationStore recipients = new CMSEnvelopedData(collidingRecipientsMessage(issuer, k)).getRecipientInfos();
+
+        assertEquals(k, recipients.size());
+        assertEquals(1, recipients.getRecipients(new KeyTransRecipientId(issuer, CMSTestUtil.collidingSerial(k))).size());
+        assertEquals(0, recipients.getRecipients(new KeyTransRecipientId(issuer, BigInteger.ONE)).size());
+
+        final byte[] small = collidingRecipientsMessage(issuer, k / 8);
+        final byte[] large = collidingRecipientsMessage(issuer, k);
+        CMSTestUtil.assertLinearGrowth("CMSEnvelopedData", new CMSTestUtil.Timed()
+        {
+            public void run()
+                throws Exception
+            {
+                new CMSEnvelopedData(small);
+            }
+        }, new CMSTestUtil.Timed()
+        {
+            public void run()
+                throws Exception
+            {
+                new CMSEnvelopedData(large);
+            }
+        });
+    }
+
+    private static byte[] collidingRecipientsMessage(X500Name issuer, int k)
+        throws IOException
+    {
+        ASN1EncodableVector ris = new ASN1EncodableVector();
+        for (int i = 1; i <= k; i++)
+        {
+            ris.add(unverifiedKeyTransRecipient(issuer, CMSTestUtil.collidingSerial(i)));
+        }
+        return unverifiedEnvelopedData(ris);
     }
 
     public static Test suite()

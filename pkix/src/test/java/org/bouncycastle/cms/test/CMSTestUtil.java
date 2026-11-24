@@ -20,10 +20,18 @@ import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
 import javax.crypto.spec.DHParameterSpec;
 
+import junit.framework.Assert;
 import org.bouncycastle.asn1.cryptopro.CryptoProObjectIdentifiers;
 import org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers;
 import org.bouncycastle.asn1.pkcs.RSAESOAEPparams;
+import org.bouncycastle.asn1.ASN1Encodable;
+import org.bouncycastle.asn1.ASN1EncodableVector;
+import org.bouncycastle.asn1.DERPrintableString;
+import org.bouncycastle.asn1.DERSequence;
+import org.bouncycastle.asn1.DERSet;
+import org.bouncycastle.asn1.DERUTF8String;
 import org.bouncycastle.asn1.x500.X500Name;
+import org.bouncycastle.asn1.x500.style.BCStyle;
 import org.bouncycastle.asn1.x509.AlgorithmIdentifier;
 import org.bouncycastle.asn1.x509.AuthorityKeyIdentifier;
 import org.bouncycastle.asn1.x509.BasicConstraints;
@@ -212,6 +220,31 @@ public class CMSTestUtil
         throws Exception
     {
         return  new X509AttributeCertificateHolder(CMSTestUtil.attrCert);
+    }
+
+    /**
+     * A name of n single-valued CN RDNs with distinct short values. The reordered form lists the
+     * same RDNs in reverse and as UTF8String rather than PrintableString, so it is equal to the
+     * plain form but encodes differently - the shape a sender uses to force a full comparison.
+     */
+    public static X500Name makeLargeName(int n, boolean reordered)
+    {
+        ASN1EncodableVector rdns = new ASN1EncodableVector();
+        for (int k = 0; k < n; k++)
+        {
+            String s = Integer.toString(reordered ? n - 1 - k : k, 36);
+            ASN1Encodable v = reordered ? (ASN1Encodable)new DERUTF8String(s) : new DERPrintableString(s);
+            rdns.add(new DERSet(new DERSequence(new ASN1Encodable[]{ BCStyle.CN, v })));
+        }
+        return X500Name.getInstance(new DERSequence(rdns));
+    }
+
+    /**
+     * The i-th of a family of serial numbers that all share one BigInteger.hashCode().
+     */
+    public static BigInteger collidingSerial(int i)
+    {
+        return BigInteger.valueOf(((long)i << 32) | ((12345 - 31 * i) & 0xffffffffL));
     }
 
     public static KeyPair makeKeyPair()
@@ -562,7 +595,73 @@ public class CMSTestUtil
         {
             bOut.write(ch);
         }
-        
+
         return bOut.toByteArray();
+    }
+
+    public interface Timed
+    {
+        void run()
+            throws Exception;
+    }
+
+    /**
+     * Check that the large case, eight times the input of the small one, takes less than 24 times as
+     * long. The two are timed alternately, so a burst of load from the parallel test forks lands on
+     * both rather than on whichever happened to be running, and the fastest of five rounds is kept.
+     * A noisy comparison is repeated before it is reported: quadratic work grows about sixty-four
+     * times and so fails every attempt.
+     */
+    public static void assertLinearGrowth(String what, Timed small, Timed large)
+        throws Exception
+    {
+        long smallTime = 0;
+        long largeTime = 0;
+        for (int attempt = 0; attempt != 3; attempt++)
+        {
+            smallTime = Long.MAX_VALUE;
+            largeTime = Long.MAX_VALUE;
+            for (int round = 0; round != 5; round++)
+            {
+                smallTime = Math.min(smallTime, timeOf(small));
+                largeTime = Math.min(largeTime, timeOf(large));
+            }
+            if (largeTime < 24 * smallTime)
+            {
+                return;
+            }
+        }
+        assertLinearGrowth(what, smallTime, largeTime);
+    }
+
+    /**
+     * The time of one run, repeating it for at least 20ms so that a short run still measures
+     * something on a coarse clock.
+     */
+    private static long timeOf(Timed timed)
+        throws Exception
+    {
+        long start = System.nanoTime();
+        long elapsed;
+        int count = 0;
+        do
+        {
+            timed.run();
+            count++;
+            elapsed = System.nanoTime() - start;
+        }
+        while (elapsed < 20000000L);
+        return elapsed / count;
+    }
+
+    /**
+     * The "stay linear" checks compare an input against one eight times its size rather than
+     * against a wall-clock bound, which a slow or loaded machine exceeds: linear work grows about
+     * eight times, the quadratic forms these tests guard against about sixty-four times.
+     */
+    public static void assertLinearGrowth(String what, long smallTime, long largeTime)
+    {
+        Assert.assertTrue(what + " time grew by " + (largeTime / Math.max(smallTime, 1L)) + "x for 8x the input ("
+            + smallTime / 1000000 + "ms, " + largeTime / 1000000 + "ms)", largeTime < 24 * smallTime);
     }
 }
