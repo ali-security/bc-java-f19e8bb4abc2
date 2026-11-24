@@ -5,6 +5,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.io.OutputStream;
 import java.io.Serializable;
 import java.io.UnsupportedEncodingException;
 import java.math.BigInteger;
@@ -48,10 +49,12 @@ import javax.security.auth.x500.X500Principal;
 
 import org.bouncycastle.asn1.ASN1Encodable;
 import org.bouncycastle.asn1.ASN1EncodableVector;
+import org.bouncycastle.asn1.ASN1Encoding;
 import org.bouncycastle.asn1.ASN1Enumerated;
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
 import org.bouncycastle.asn1.ASN1OctetString;
 import org.bouncycastle.asn1.ASN1Primitive;
+import org.bouncycastle.asn1.ASN1Sequence;
 import org.bouncycastle.asn1.DERNull;
 import org.bouncycastle.asn1.DEROctetString;
 import org.bouncycastle.asn1.DERSequence;
@@ -112,6 +115,7 @@ import org.bouncycastle.jce.spec.ECPublicKeySpec;
 import org.bouncycastle.jce.spec.GOST3410ParameterSpec;
 import org.bouncycastle.math.ec.ECCurve;
 import org.bouncycastle.operator.ContentSigner;
+import org.bouncycastle.operator.ContentVerifier;
 import org.bouncycastle.operator.ContentVerifierProvider;
 import org.bouncycastle.operator.DefaultDigestAlgorithmIdentifierFinder;
 import org.bouncycastle.operator.DefaultSignatureAlgorithmIdentifierFinder;
@@ -3923,6 +3927,98 @@ public class CertTest
         isTrue(privKey.equals(compPrivKey));
     }
 
+    private boolean verifyCompositeSignature(CompositePublicKey compPub, AlgorithmIdentifier sigAlgId, byte[] tbs, byte[] signature)
+        throws Exception
+    {
+        ContentVerifier cv = new JcaContentVerifierProviderBuilder().build(compPub).get(sigAlgId);
+
+        OutputStream sOut = cv.getOutputStream();
+
+        sOut.write(tbs);
+
+        sOut.close();
+
+        return cv.verify(signature);
+    }
+
+    private void checkCompositeSignatureStripping()
+        throws Exception
+    {
+        // CVE-2026-5588: the legacy id_alg_composite ContentVerifier took the number of
+        // components to check from the supplied signature sequence rather than from the key,
+        // so a composite signature with components removed - an empty sequence, or one
+        // truncated to a single genuinely verifiable component - was accepted as valid.
+        // A composite signature MUST carry exactly one component for every component key.
+        //
+        // set up the keys
+        //
+        KeyPairGenerator ecKpg = KeyPairGenerator.getInstance("EC", "BC");
+
+        ecKpg.initialize(new ECGenParameterSpec("P-256"));
+
+        KeyPair ecKp = ecKpg.generateKeyPair();
+
+        PrivateKey ecPriv = ecKp.getPrivate();
+        PublicKey ecPub = ecKp.getPublic();
+
+        KeyPairGenerator lmsKpg = KeyPairGenerator.getInstance("LMS", "BCPQC");
+
+        lmsKpg.initialize(new LMSKeyGenParameterSpec(LMSigParameters.lms_sha256_n32_h5, LMOtsParameters.sha256_n32_w1));
+
+        KeyPair lmsKp = lmsKpg.generateKeyPair();
+
+        PrivateKey lmsPriv = lmsKp.getPrivate();
+        PublicKey lmsPub = lmsKp.getPublic();
+
+        X500Name issuer = createStdBuilder().build();
+
+        //
+        // component 0 = ECDSA, component 1 = LMS
+        //
+        CompositeAlgorithmSpec compAlgSpec = new CompositeAlgorithmSpec.Builder()
+            .add("SHA256withECDSA")
+            .add("LMS")
+            .build();
+        CompositePublicKey compPub = new CompositePublicKey(ecPub, lmsPub);
+        CompositePrivateKey compPrivKey = new CompositePrivateKey(ecPriv, lmsPriv);
+
+        ContentSigner sigGen = new JcaContentSignerBuilder("Composite", compAlgSpec).build(compPrivKey);
+
+        X509v3CertificateBuilder certGen = new JcaX509v3CertificateBuilder(
+            issuer,
+            BigInteger.valueOf(1),
+            new Date(System.currentTimeMillis() - 50000), new Date(System.currentTimeMillis() + 50000), issuer,
+            compPub);
+
+        X509CertificateHolder certHldr = certGen.build(sigGen);
+
+        AlgorithmIdentifier sigAlgId = certHldr.getSignatureAlgorithm();
+        byte[] tbs = certHldr.toASN1Structure().getTBSCertificate().getEncoded(ASN1Encoding.DER);
+
+        ASN1Sequence sigSeq = ASN1Sequence.getInstance(certHldr.getSignature());
+
+        isEquals("expected a two component composite signature", 2, sigSeq.size());
+
+        // the genuine 2 of 2 composite signature verifies
+        isTrue("genuine composite signature should verify",
+            verifyCompositeSignature(compPub, sigAlgId, tbs, sigSeq.getEncoded(ASN1Encoding.DER)));
+
+        // an empty component sequence leaves nothing checked - it must not verify
+        isTrue("empty composite signature must not verify",
+            !verifyCompositeSignature(compPub, sigAlgId, tbs,
+                new DERSequence().getEncoded(ASN1Encoding.DER)));
+
+        // strip the LMS component, leaving only the (genuine) ECDSA one
+        isTrue("composite signature stripped of a component must not verify",
+            !verifyCompositeSignature(compPub, sigAlgId, tbs,
+                new DERSequence(sigSeq.getObjectAt(0)).getEncoded(ASN1Encoding.DER)));
+
+        // ... and an over length sequence must be rejected as well
+        isTrue("composite signature with an extra component must not verify",
+            !verifyCompositeSignature(compPub, sigAlgId, tbs,
+                new DERSequence(new ASN1Encodable[]{ sigSeq.getObjectAt(0), sigSeq.getObjectAt(1), sigSeq.getObjectAt(0) }).getEncoded(ASN1Encoding.DER)));
+    }
+
     private void checkCompositeCertificateVerify()
         throws Exception
     {
@@ -4799,6 +4895,7 @@ public class CertTest
 
         checkCreationComposite();
         checkCompositeCertificateVerify();
+        checkCompositeSignatureStripping();
 
         createECCert("SHA1withECDSA", X9ObjectIdentifiers.ecdsa_with_SHA1);
         createECCert("SHA224withECDSA", X9ObjectIdentifiers.ecdsa_with_SHA224);
