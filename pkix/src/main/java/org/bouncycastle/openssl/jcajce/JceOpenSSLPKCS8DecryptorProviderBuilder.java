@@ -2,8 +2,12 @@ package org.bouncycastle.openssl.jcajce;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.math.BigInteger;
+import java.security.AccessControlException;
+import java.security.AccessController;
 import java.security.AlgorithmParameters;
 import java.security.GeneralSecurityException;
+import java.security.PrivilegedAction;
 import java.security.Provider;
 
 import javax.crypto.Cipher;
@@ -75,7 +79,8 @@ public class JceOpenSSLPKCS8DecryptorProviderBuilder
                         EncryptionScheme scheme = params.getEncryptionScheme();
                         PBKDF2Params defParams = (PBKDF2Params)func.getParameters();
 
-                        int iterationCount = defParams.getIterationCount().intValue();
+                        // Bound the unauthenticated iteration count before deriving the key.
+                        int iterationCount = checkIterationCount(defParams.getIterationCount());
                         byte[] salt = defParams.getSalt();
 
                         String oid = scheme.getAlgorithm().getId();
@@ -104,7 +109,7 @@ public class JceOpenSSLPKCS8DecryptorProviderBuilder
 
                         cipher = helper.createCipher(algorithm.getAlgorithm().getId());
 
-                        cipher.init(Cipher.DECRYPT_MODE, new PKCS12KeyWithParameters(password, params.getIV(), params.getIterations().intValue()));
+                        cipher.init(Cipher.DECRYPT_MODE, new PKCS12KeyWithParameters(password, params.getIV(), checkIterationCount(params.getIterations())));
                     }
                     else if (PEMUtilities.isPKCS5Scheme1(algorithm.getAlgorithm()))
                     {
@@ -123,7 +128,7 @@ public class JceOpenSSLPKCS8DecryptorProviderBuilder
                             {
                                 return Strings.toByteArray(password);     // just drop hi-order byte.
                             }
-                        }, params.getSalt(), params.getIterationCount().intValue()));
+                        }, params.getSalt(), checkIterationCount(params.getIterationCount())));
                     }
                     else
                     {
@@ -153,5 +158,60 @@ public class JceOpenSSLPKCS8DecryptorProviderBuilder
                 }
             };
         };
+    }
+
+    /**
+     * Upper bound on the PBKDF2 iteration count honoured when decrypting a PBES2-protected
+     * PKCS#8 / PEM private key. The key-derivation parameters travel inside the (unauthenticated)
+     * encrypted-key container, so an unbounded count makes decrypting attacker-supplied key
+     * material a CPU-exhaustion vector. Default 10,000,000, generous enough for deliberately
+     * strong settings.
+     */
+    private static final String PBE_MAX_ITERATION_COUNT = "org.bouncycastle.pbe.max_iteration_count";
+    private static final int DEFAULT_MAX_ITERATION_COUNT = 10000000;
+
+    private static int checkIterationCount(BigInteger ic)
+        throws IOException
+    {
+        if (ic == null || ic.signum() < 0 || ic.bitLength() > 31)
+        {
+            throw new IOException("invalid iteration count");
+        }
+
+        long max = maxIterationCount();
+        if (ic.longValue() > max)
+        {
+            throw new IOException("iteration count (" + ic + ") greater than " + max);
+        }
+
+        return ic.intValue();
+    }
+
+    private static int maxIterationCount()
+    {
+        // Read directly rather than through org.bouncycastle.util.Properties: that class is
+        // shipped by the provider jar, which is resolved independently of this one.
+        String p = (String)AccessController.doPrivileged(new PrivilegedAction()
+        {
+            // JDK 1.4 compatibility
+            public Object run()
+            {
+                try
+                {
+                    return System.getProperty(PBE_MAX_ITERATION_COUNT);
+                }
+                catch (AccessControlException e)
+                {
+                    return null;
+                }
+            }
+        });
+
+        if (p != null)
+        {
+            return Integer.parseInt(p);
+        }
+
+        return DEFAULT_MAX_ITERATION_COUNT;
     }
 }

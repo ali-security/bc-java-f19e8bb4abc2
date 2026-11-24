@@ -26,8 +26,11 @@ import javax.crypto.spec.PBEKeySpec;
 
 import junit.framework.TestCase;
 import org.bouncycastle.asn1.ASN1Encodable;
+import org.bouncycastle.asn1.ASN1EncodableVector;
 import org.bouncycastle.asn1.ASN1Encoding;
+import org.bouncycastle.asn1.ASN1Integer;
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
+import org.bouncycastle.asn1.ASN1Sequence;
 import org.bouncycastle.asn1.DERBMPString;
 import org.bouncycastle.asn1.DERSequence;
 import org.bouncycastle.asn1.cryptopro.CryptoProObjectIdentifiers;
@@ -35,11 +38,14 @@ import org.bouncycastle.asn1.nist.NISTObjectIdentifiers;
 import org.bouncycastle.asn1.oiw.OIWObjectIdentifiers;
 import org.bouncycastle.asn1.pkcs.Attribute;
 import org.bouncycastle.asn1.pkcs.ContentInfo;
+import org.bouncycastle.asn1.pkcs.MacData;
 import org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers;
+import org.bouncycastle.asn1.pkcs.Pfx;
 import org.bouncycastle.asn1.pkcs.PrivateKeyInfo;
 import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.asn1.x500.X500NameBuilder;
 import org.bouncycastle.asn1.x500.style.BCStyle;
+import org.bouncycastle.asn1.x509.AlgorithmIdentifier;
 import org.bouncycastle.asn1.x509.BasicConstraints;
 import org.bouncycastle.asn1.x509.Extension;
 import org.bouncycastle.asn1.x509.SubjectKeyIdentifier;
@@ -55,6 +61,7 @@ import org.bouncycastle.crypto.engines.DESedeEngine;
 import org.bouncycastle.crypto.engines.RC2Engine;
 import org.bouncycastle.crypto.modes.CBCBlockCipher;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
+import org.bouncycastle.openssl.jcajce.JceOpenSSLPKCS8DecryptorProviderBuilder;
 import org.bouncycastle.operator.InputDecryptorProvider;
 import org.bouncycastle.operator.OutputEncryptor;
 import org.bouncycastle.operator.bc.BcDefaultDigestProvider;
@@ -79,12 +86,16 @@ import org.bouncycastle.pkcs.jcajce.JcePKCSPBEInputDecryptorProviderBuilder;
 import org.bouncycastle.pkcs.jcajce.JcePKCSPBEOutputEncryptorBuilder;
 import org.bouncycastle.util.Arrays;
 import org.bouncycastle.util.encoders.Base64;
+import org.bouncycastle.util.encoders.Hex;
 
 public class PfxPduTest
     extends TestCase
 {
     private static final String BC = BouncyCastleProvider.PROVIDER_NAME;
     private static final char[] passwd = {'h', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd'};
+
+    private static final String PBE_MAX_ITERATION_COUNT = "org.bouncycastle.pbe.max_iteration_count";
+    private static final String PKCS12_MAX_IT_COUNT = "org.bouncycastle.pkcs12.max_it_count";
 
     //
     // personal keys
@@ -1169,6 +1180,213 @@ public class PfxPduTest
         doPKCS5Test(pkcs5Camellia256Pfx);
         doPKCS5Test(pkcs5Cast5Pfx);
         doPKCS5Test(pkcs5TripleDesPfx);
+    }
+
+    public void testDodgyInputs()
+        throws Exception
+    {
+        byte[] negIt = Hex.decode("3049020103301106092a864879f70d010706a004040230003031302130" +
+            "0906052b0e03021a0500041400000100000000000000000000000000" +
+            "00000000040800000000000000000202f300");
+
+        PKCS12PfxPdu pfx = new PKCS12PfxPdu(negIt);
+
+        // The MacData carries a negative iteration count. The PKCS#12-PBE MAC key derivation now
+        // validates the wire-supplied count, so a negative count is rejected cleanly rather than
+        // driving a zero-round KDF that silently produces a weak MAC key.
+        try
+        {
+            pfx.isMacValid(new JcePKCS12MacCalculatorBuilderProvider().setProvider("BC"), passwd);
+            fail("negative iteration count not rejected");
+        }
+        catch (PKCSException e)
+        {
+            assertTrue(e.getMessage().endsWith("negative iteration count found"));
+        }
+    }
+
+    /**
+     * The PKCS#12 MacData iteration count is read from the PFX before the MAC can be checked, so
+     * both MAC calculator providers must bound it rather than run an attacker-chosen KDF cost.
+     */
+    public void testMacIterationCountBound()
+        throws Exception
+    {
+        KeyFactory fact = KeyFactory.getInstance("RSA", BC);
+        PrivateKey privKey = fact.generatePrivate(privKeySpec);
+        PublicKey pubKey = fact.generatePublic(pubKeySpec);
+
+        X509Certificate[] chain = createCertChain(fact, pubKey);
+
+        PKCS12PfxPdu pfx = createPfx(privKey, pubKey, chain);
+
+        String old = setProperty(PKCS12_MAX_IT_COUNT, null);
+        try
+        {
+            // a legitimate count still verifies.
+            assertTrue(pfx.isMacValid(new BcPKCS12MacCalculatorBuilderProvider(BcDefaultDigestProvider.INSTANCE), passwd));
+            assertTrue(pfx.isMacValid(new JcePKCS12MacCalculatorBuilderProvider().setProvider("BC"), passwd));
+
+            // a count above the built in 5,000,000 ceiling is refused before the derivation.
+            Pfx pfxStruct = pfx.toASN1Structure();
+            MacData macData = pfxStruct.getMacData();
+            PKCS12PfxPdu tampered = new PKCS12PfxPdu(new Pfx(pfxStruct.getAuthSafe(),
+                new MacData(macData.getMac(), macData.getSalt(), 5000001)));
+
+            checkMacRejected(tampered, "greater than 5000000");
+        }
+        finally
+        {
+            setProperty(PKCS12_MAX_IT_COUNT, old);
+        }
+
+        // the ceiling is configurable.
+        old = setProperty(PKCS12_MAX_IT_COUNT, "1");
+        try
+        {
+            checkMacRejected(pfx, "greater than 1");
+        }
+        finally
+        {
+            setProperty(PKCS12_MAX_IT_COUNT, old);
+        }
+    }
+
+    private void checkMacRejected(PKCS12PfxPdu pfx, String expected)
+    {
+        try
+        {
+            pfx.isMacValid(new BcPKCS12MacCalculatorBuilderProvider(BcDefaultDigestProvider.INSTANCE), passwd);
+            fail("excessive MAC iteration count accepted");
+        }
+        catch (PKCSException e)
+        {
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().indexOf(expected) >= 0);
+        }
+
+        try
+        {
+            pfx.isMacValid(new JcePKCS12MacCalculatorBuilderProvider().setProvider("BC"), passwd);
+            fail("excessive MAC iteration count accepted");
+        }
+        catch (PKCSException e)
+        {
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().indexOf(expected) >= 0);
+        }
+    }
+
+    /**
+     * The legacy PKCS#5 v1.5 (PBES1) branch of both PKCS#8 decryptors feeds the unauthenticated
+     * PBKDF1 iteration count into the key derivation, so it carries the same bound as PBES2.
+     */
+    public void testPBES1IterationCountBound()
+        throws Exception
+    {
+        char[] password = "PKCS#5 Scheme 1".toCharArray();
+        PKCS8EncryptedPrivateKeyInfo encInfo = new PKCS8EncryptedPrivateKeyInfo(desWithSha1);
+
+        assertEquals(PKCSObjectIdentifiers.pbeWithSHA1AndDES_CBC, encInfo.getEncryptionAlgorithm().getAlgorithm());
+
+        // a legitimate count still decrypts.
+        checkPBES1Decrypts(encInfo, new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build(password));
+        checkPBES1Decrypts(encInfo, new JceOpenSSLPKCS8DecryptorProviderBuilder().setProvider("BC").build(password));
+
+        // the bound is configurable.
+        String old = setProperty(PBE_MAX_ITERATION_COUNT, "1");
+        try
+        {
+            checkDecryptRejected(encInfo, new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build(password), "greater than 1");
+            checkDecryptRejected(encInfo, new JceOpenSSLPKCS8DecryptorProviderBuilder().setProvider("BC").build(password), "greater than 1");
+        }
+        finally
+        {
+            setProperty(PBE_MAX_ITERATION_COUNT, old);
+        }
+
+        old = setProperty(PBE_MAX_ITERATION_COUNT, null);
+        try
+        {
+            // an attacker chosen count above the built in 10,000,000 bound.
+            PKCS8EncryptedPrivateKeyInfo tampered = withPbeIterationCount(encInfo, new ASN1Integer(10000001));
+
+            checkDecryptRejected(tampered, new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build(password), "greater than 10000000");
+            checkDecryptRejected(tampered, new JceOpenSSLPKCS8DecryptorProviderBuilder().setProvider("BC").build(password), "greater than 10000000");
+
+            // 2^32 + 1024 truncates to the genuine count (1024) through intValue(), so it must be
+            // checked as encoded.
+            tampered = withPbeIterationCount(encInfo, new ASN1Integer(BigInteger.valueOf(2).pow(32).add(BigInteger.valueOf(1024))));
+
+            checkDecryptRejected(tampered, new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build(password), "invalid iteration count");
+            checkDecryptRejected(tampered, new JceOpenSSLPKCS8DecryptorProviderBuilder().setProvider("BC").build(password), "invalid iteration count");
+        }
+        finally
+        {
+            setProperty(PBE_MAX_ITERATION_COUNT, old);
+        }
+    }
+
+    private void checkPBES1Decrypts(PKCS8EncryptedPrivateKeyInfo encInfo, InputDecryptorProvider decryptorProvider)
+        throws Exception
+    {
+        PrivateKeyInfo info = encInfo.decryptPrivateKeyInfo(decryptorProvider);
+
+        assertEquals(privKeySpec.getModulus(),
+            org.bouncycastle.asn1.pkcs.RSAPrivateKey.getInstance(info.parsePrivateKey()).getModulus());
+    }
+
+    private static void checkDecryptRejected(
+        PKCS8EncryptedPrivateKeyInfo encInfo,
+        InputDecryptorProvider decryptorProvider,
+        String expected)
+    {
+        try
+        {
+            encInfo.decryptPrivateKeyInfo(decryptorProvider);
+            fail("excessive iteration count accepted");
+        }
+        catch (PKCSException e)
+        {
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().indexOf(expected) >= 0);
+        }
+    }
+
+    private static PKCS8EncryptedPrivateKeyInfo withPbeIterationCount(
+        PKCS8EncryptedPrivateKeyInfo encInfo,
+        ASN1Integer iterationCount)
+        throws IOException
+    {
+        org.bouncycastle.asn1.pkcs.EncryptedPrivateKeyInfo info = encInfo.toASN1Structure();
+        AlgorithmIdentifier algId = info.getEncryptionAlgorithm();
+        ASN1Sequence params = ASN1Sequence.getInstance(algId.getParameters());
+
+        ASN1EncodableVector v = new ASN1EncodableVector();
+
+        v.add(params.getObjectAt(0));
+        v.add(iterationCount);
+
+        org.bouncycastle.asn1.pkcs.EncryptedPrivateKeyInfo tampered = new org.bouncycastle.asn1.pkcs.EncryptedPrivateKeyInfo(
+            new AlgorithmIdentifier(algId.getAlgorithm(), new DERSequence(v)), info.getEncryptedData());
+
+        return new PKCS8EncryptedPrivateKeyInfo(tampered.getEncoded());
+    }
+
+    /**
+     * Set (or, for a null value, clear) a system property, returning its previous value.
+     */
+    private static String setProperty(String name, String value)
+    {
+        String old = System.getProperty(name);
+
+        if (value == null)
+        {
+            System.clearProperty(name);
+        }
+        else
+        {
+            System.setProperty(name, value);
+        }
+
+        return old;
     }
 
     private void doPKCS5Test(byte[] keyStore)

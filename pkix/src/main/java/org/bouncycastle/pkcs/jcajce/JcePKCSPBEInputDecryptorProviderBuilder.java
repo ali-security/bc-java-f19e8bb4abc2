@@ -1,7 +1,12 @@
 package org.bouncycastle.pkcs.jcajce;
 
+import java.io.IOException;
 import java.io.InputStream;
+import java.math.BigInteger;
+import java.security.AccessControlException;
+import java.security.AccessController;
 import java.security.AlgorithmParameters;
+import java.security.PrivilegedAction;
 import java.security.Provider;
 
 import javax.crypto.Cipher;
@@ -109,7 +114,7 @@ public class JcePKCSPBEInputDecryptorProviderBuilder
 
                         cipher = helper.createCipher(algorithm.getId());
 
-                        cipher.init(Cipher.DECRYPT_MODE, new PKCS12KeyWithParameters(password, wrongPKCS12Zero, pbeParams.getIV(), pbeParams.getIterations().intValue()));
+                        cipher.init(Cipher.DECRYPT_MODE, new PKCS12KeyWithParameters(password, wrongPKCS12Zero, pbeParams.getIV(), checkIterationCount(pbeParams.getIterations())));
 
                         encryptionAlg = algorithmIdentifier;
                     }
@@ -121,6 +126,10 @@ public class JcePKCSPBEInputDecryptorProviderBuilder
                         {
                             ScryptParams params = ScryptParams.getInstance(alg.getKeyDerivationFunc().getParameters());
                             AlgorithmIdentifier encScheme = AlgorithmIdentifier.getInstance(alg.getEncryptionScheme());
+
+                            // The KDF cost travels in the unauthenticated container, so bound it
+                            // before deriving the key to cap the memory-exhaustion vector.
+                            checkScryptCost(params);
 
                             SecretKeyFactory keyFact = helper.createSecretKeyFactory("SCRYPT");
 
@@ -134,13 +143,16 @@ public class JcePKCSPBEInputDecryptorProviderBuilder
                             PBKDF2Params func = PBKDF2Params.getInstance(alg.getKeyDerivationFunc().getParameters());
                             AlgorithmIdentifier encScheme = AlgorithmIdentifier.getInstance(alg.getEncryptionScheme());
 
+                            // Bound the unauthenticated iteration count before deriving the key.
+                            int iterationCount = checkIterationCount(func.getIterationCount());
+
                             if (func.isDefaultPrf())
                             {
-                                key = keyFact.generateSecret(new PBEKeySpec(password, func.getSalt(), func.getIterationCount().intValue(), keySizeProvider.getKeySize(encScheme)));
+                                key = keyFact.generateSecret(new PBEKeySpec(password, func.getSalt(), iterationCount, keySizeProvider.getKeySize(encScheme)));
                             }
                             else
                             {
-                                key = keyFact.generateSecret(new PBKDF2KeySpec(password, func.getSalt(), func.getIterationCount().intValue(), keySizeProvider.getKeySize(encScheme), func.getPrf()));
+                                key = keyFact.generateSecret(new PBKDF2KeySpec(password, func.getSalt(), iterationCount, keySizeProvider.getKeySize(encScheme), func.getPrf()));
                             }
                         }
 
@@ -181,7 +193,7 @@ public class JcePKCSPBEInputDecryptorProviderBuilder
                         cipher = helper.createCipher(algorithm.getId());
 
                         cipher.init(Cipher.DECRYPT_MODE, new PBKDF1Key(password, PasswordConverter.ASCII),
-                                new PBEParameterSpec(pbeParams.getSalt(), pbeParams.getIterationCount().intValue()));
+                                new PBEParameterSpec(pbeParams.getSalt(), checkIterationCount(pbeParams.getIterationCount())));
                     }
                     else
                     {
@@ -224,5 +236,99 @@ public class JcePKCSPBEInputDecryptorProviderBuilder
         }
 
         return false;
+    }
+
+    /**
+     * Upper bound on the PBKDF2 / PBKDF1 / PKCS#12-PBE iteration count honoured when decrypting a
+     * PBE-protected PKCS#8 / PKCS#12 container. The key-derivation parameters travel inside the
+     * (unauthenticated) encrypted container, so an unbounded count makes decrypting
+     * attacker-supplied material a CPU-exhaustion vector. Default 10,000,000, generous enough
+     * for deliberately strong settings.
+     */
+    private static final String PBE_MAX_ITERATION_COUNT = "org.bouncycastle.pbe.max_iteration_count";
+    private static final int DEFAULT_MAX_ITERATION_COUNT = 10000000;
+
+    /**
+     * Upper bound, in bytes, on the scrypt working memory (~128 * N * r) honoured when decrypting
+     * a PBES2-protected container. As with the iteration count the scrypt cost travels in the
+     * unauthenticated container, so an unbounded cost is a memory-exhaustion vector.
+     * Default 1073741824 (1 GiB).
+     */
+    private static final String PBE_MAX_SCRYPT_MEMORY = "org.bouncycastle.pbe.max_scrypt_memory";
+    private static final int DEFAULT_MAX_SCRYPT_MEMORY = 1 << 30;
+
+    // The KDF cost parameters of a PBES2-protected key arrive in an unauthenticated container, so
+    // they are bounded before the (memory/CPU intensive) derivation to cap a decryption-time DoS.
+    private static final int MAX_SCRYPT_BLOCK_SIZE = 1024;
+
+    private static void checkScryptCost(ScryptParams params)
+        throws IOException
+    {
+        BigInteger n = params.getCostParameter();
+        BigInteger r = params.getBlockSize();
+
+        if (n == null || r == null
+            || n.signum() <= 0 || r.signum() <= 0
+            || n.bitLength() > 31 || r.bitLength() > 31)
+        {
+            throw new IOException("invalid scrypt parameters");
+        }
+
+        long blockSize = r.longValue();
+        if (blockSize > MAX_SCRYPT_BLOCK_SIZE)
+        {
+            throw new IOException("scrypt block size (" + blockSize + ") greater than " + MAX_SCRYPT_BLOCK_SIZE);
+        }
+
+        long maxMemory = getIntProperty(PBE_MAX_SCRYPT_MEMORY, DEFAULT_MAX_SCRYPT_MEMORY);
+        if (n.longValue() > maxMemory / (128L * blockSize))
+        {
+            throw new IOException("scrypt cost parameters require more than " + maxMemory + " bytes");
+        }
+    }
+
+    private static int checkIterationCount(BigInteger ic)
+        throws IOException
+    {
+        if (ic == null || ic.signum() < 0 || ic.bitLength() > 31)
+        {
+            throw new IOException("invalid iteration count");
+        }
+
+        long max = getIntProperty(PBE_MAX_ITERATION_COUNT, DEFAULT_MAX_ITERATION_COUNT);
+        if (ic.longValue() > max)
+        {
+            throw new IOException("iteration count (" + ic + ") greater than " + max);
+        }
+
+        return ic.intValue();
+    }
+
+    private static int getIntProperty(final String propertyName, int defaultValue)
+    {
+        // Read directly rather than through org.bouncycastle.util.Properties: that class is
+        // shipped by the provider jar, which is resolved independently of this one.
+        String p = (String)AccessController.doPrivileged(new PrivilegedAction()
+        {
+            // JDK 1.4 compatibility
+            public Object run()
+            {
+                try
+                {
+                    return System.getProperty(propertyName);
+                }
+                catch (AccessControlException e)
+                {
+                    return null;
+                }
+            }
+        });
+
+        if (p != null)
+        {
+            return Integer.parseInt(p);
+        }
+
+        return defaultValue;
     }
 }

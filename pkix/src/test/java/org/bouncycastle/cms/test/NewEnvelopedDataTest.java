@@ -34,12 +34,16 @@ import junit.framework.Assert;
 import junit.framework.Test;
 import junit.framework.TestCase;
 import junit.framework.TestSuite;
+import org.bouncycastle.asn1.ASN1EncodableVector;
 import org.bouncycastle.asn1.ASN1InputStream;
+import org.bouncycastle.asn1.ASN1Integer;
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
 import org.bouncycastle.asn1.ASN1OctetString;
 import org.bouncycastle.asn1.ASN1Sequence;
+import org.bouncycastle.asn1.ASN1Set;
 import org.bouncycastle.asn1.DERNull;
 import org.bouncycastle.asn1.DEROctetString;
+import org.bouncycastle.asn1.DERSequence;
 import org.bouncycastle.asn1.DERSet;
 import org.bouncycastle.asn1.DERUTF8String;
 import org.bouncycastle.asn1.cms.Attribute;
@@ -49,6 +53,8 @@ import org.bouncycastle.asn1.cms.ContentInfo;
 import org.bouncycastle.asn1.cms.EncryptedContentInfo;
 import org.bouncycastle.asn1.cms.EnvelopedData;
 import org.bouncycastle.asn1.cms.GCMParameters;
+import org.bouncycastle.asn1.cms.PasswordRecipientInfo;
+import org.bouncycastle.asn1.cms.RecipientInfo;
 import org.bouncycastle.asn1.cryptopro.CryptoProObjectIdentifiers;
 import org.bouncycastle.asn1.kisa.KISAObjectIdentifiers;
 import org.bouncycastle.asn1.nist.NISTObjectIdentifiers;
@@ -108,6 +114,9 @@ public class NewEnvelopedDataTest
     extends TestCase
 {
     private static final String BC = BouncyCastleProvider.PROVIDER_NAME;
+
+    private static final String PBE_MAX_ITERATION_COUNT = "org.bouncycastle.pbe.max_iteration_count";
+    private static final byte[] PASSWORD_DATA = Hex.decode("504b492d4320434d5320456e76656c6f706564446174612053616d706c65");
 
     private static String _signDN;
     private static KeyPair _signKP;
@@ -1999,6 +2008,188 @@ public class NewEnvelopedDataTest
         passwordUTF8Test(CMSEnvelopedDataGenerator.AES256_CBC, PasswordRecipient.PRF.HMacSHA256);
         passwordUTF8Test(CMSEnvelopedDataGenerator.AES256_CBC, PasswordRecipient.PRF.HMacSHA384);
         passwordUTF8Test(CMSEnvelopedDataGenerator.AES256_CBC, PasswordRecipient.PRF.HMacSHA512);
+    }
+
+    /**
+     * The PBKDF2 iteration count of a PasswordRecipientInfo travels unauthenticated in the
+     * EnvelopedData and is honoured before anything is verified, so both password recipients
+     * must bound it before running the key derivation.
+     */
+    public void testPasswordIterationCountBound()
+        throws Exception
+    {
+        CMSEnvelopedData ed = createPasswordEnvelopedData();
+
+        String old = setProperty(PBE_MAX_ITERATION_COUNT, null);
+        try
+        {
+            // a legitimate count still decrypts.
+            checkPasswordDecrypts(ed);
+        }
+        finally
+        {
+            setProperty(PBE_MAX_ITERATION_COUNT, old);
+        }
+
+        // the bound is configurable.
+        old = setProperty(PBE_MAX_ITERATION_COUNT, "1");
+        try
+        {
+            checkPasswordRejected(ed, "greater than 1");
+        }
+        finally
+        {
+            setProperty(PBE_MAX_ITERATION_COUNT, old);
+        }
+    }
+
+    public void testPasswordIterationCountDefaultBound()
+        throws Exception
+    {
+        CMSEnvelopedData ed = withPasswordIterationCount(createPasswordEnvelopedData(), new ASN1Integer(10000001));
+
+        String old = setProperty(PBE_MAX_ITERATION_COUNT, null);
+        try
+        {
+            checkPasswordRejected(ed, "greater than 10000000");
+        }
+        finally
+        {
+            setProperty(PBE_MAX_ITERATION_COUNT, old);
+        }
+    }
+
+    /**
+     * 2^32 + 5 truncates to the genuine count (5) through intValue(), so an unchecked recipient
+     * would decrypt the message - the count has to be checked as it was encoded. A negative
+     * count is rejected as well.
+     */
+    public void testPasswordOversizedIterationCount()
+        throws Exception
+    {
+        CMSEnvelopedData ed = withPasswordIterationCount(createPasswordEnvelopedData(),
+            new ASN1Integer(BigInteger.valueOf(2).pow(32).add(BigInteger.valueOf(5))));
+
+        checkPasswordRejected(ed, "greater than");
+
+        ed = withPasswordIterationCount(createPasswordEnvelopedData(), new ASN1Integer(BigInteger.valueOf(-1)));
+
+        checkPasswordRejected(ed, "greater than");
+    }
+
+    private CMSEnvelopedData createPasswordEnvelopedData()
+        throws Exception
+    {
+        CMSEnvelopedDataGenerator edGen = new CMSEnvelopedDataGenerator();
+
+        edGen.addRecipientInfoGenerator(new JcePasswordRecipientInfoGenerator(CMSAlgorithm.AES256_CBC, "password".toCharArray()).setProvider(BC).setSaltAndIterationCount(new byte[20], 5));
+
+        return edGen.generate(
+            new CMSProcessableByteArray(PASSWORD_DATA),
+            new JceCMSContentEncryptorBuilder(CMSAlgorithm.AES128_CBC).setProvider(BC).build());
+    }
+
+    /**
+     * Re-encode an EnvelopedData with an attacker chosen PBKDF2 iteration count in each of its
+     * PasswordRecipientInfos.
+     */
+    private static CMSEnvelopedData withPasswordIterationCount(CMSEnvelopedData ed, ASN1Integer iterationCount)
+        throws Exception
+    {
+        ContentInfo contentInfo = ed.toASN1Structure();
+        EnvelopedData envData = EnvelopedData.getInstance(contentInfo.getContent());
+        ASN1Set recipientInfos = envData.getRecipientInfos();
+        ASN1EncodableVector tamperedInfos = new ASN1EncodableVector();
+
+        for (int i = 0; i != recipientInfos.size(); i++)
+        {
+            PasswordRecipientInfo pri = (PasswordRecipientInfo)RecipientInfo.getInstance(recipientInfos.getObjectAt(i)).getInfo();
+            PBKDF2Params kdfParams = PBKDF2Params.getInstance(pri.getKeyDerivationAlgorithm().getParameters());
+
+            ASN1EncodableVector v = new ASN1EncodableVector();
+
+            v.add(new DEROctetString(kdfParams.getSalt()));
+            v.add(iterationCount);
+            if (kdfParams.getKeyLength() != null)
+            {
+                v.add(new ASN1Integer(kdfParams.getKeyLength()));
+            }
+            if (!kdfParams.isDefaultPrf())
+            {
+                v.add(kdfParams.getPrf());
+            }
+
+            AlgorithmIdentifier kdfAlg = new AlgorithmIdentifier(pri.getKeyDerivationAlgorithm().getAlgorithm(), new DERSequence(v));
+
+            tamperedInfos.add(new RecipientInfo(new PasswordRecipientInfo(kdfAlg, pri.getKeyEncryptionAlgorithm(), pri.getEncryptedKey())));
+        }
+
+        EnvelopedData tampered = new EnvelopedData(envData.getOriginatorInfo(), new DERSet(tamperedInfos),
+            envData.getEncryptedContentInfo(), envData.getUnprotectedAttrs());
+
+        return new CMSEnvelopedData(new ContentInfo(contentInfo.getContentType(), tampered));
+    }
+
+    private static void checkPasswordDecrypts(CMSEnvelopedData ed)
+        throws Exception
+    {
+        Iterator it = ed.getRecipientInfos().getRecipients().iterator();
+
+        assertTrue(it.hasNext());
+
+        RecipientInformation recipient = (RecipientInformation)it.next();
+
+        assertTrue(Arrays.equals(PASSWORD_DATA, recipient.getContent(new JcePasswordEnvelopedRecipient("password".toCharArray()).setProvider(BC))));
+        assertTrue(Arrays.equals(PASSWORD_DATA, recipient.getContent(new BcPasswordEnvelopedRecipient("password".toCharArray()))));
+    }
+
+    private static void checkPasswordRejected(CMSEnvelopedData ed, String expected)
+        throws Exception
+    {
+        Iterator it = ed.getRecipientInfos().getRecipients().iterator();
+
+        assertTrue(it.hasNext());
+
+        RecipientInformation recipient = (RecipientInformation)it.next();
+
+        try
+        {
+            recipient.getContent(new JcePasswordEnvelopedRecipient("password".toCharArray()).setProvider(BC));
+            fail("excessive PBKDF2 iteration count accepted");
+        }
+        catch (CMSException e)
+        {
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().indexOf(expected) >= 0);
+        }
+
+        try
+        {
+            recipient.getContent(new BcPasswordEnvelopedRecipient("password".toCharArray()));
+            fail("excessive PBKDF2 iteration count accepted");
+        }
+        catch (CMSException e)
+        {
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().indexOf(expected) >= 0);
+        }
+    }
+
+    /**
+     * Set (or, for a null value, clear) a system property, returning its previous value.
+     */
+    private static String setProperty(String name, String value)
+    {
+        String old = System.getProperty(name);
+
+        if (value == null)
+        {
+            System.clearProperty(name);
+        }
+        else
+        {
+            System.setProperty(name, value);
+        }
+
+        return old;
     }
 
     public void testNoSaltOrIterationCount()
