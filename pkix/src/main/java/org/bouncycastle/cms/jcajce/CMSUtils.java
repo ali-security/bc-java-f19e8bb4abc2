@@ -12,15 +12,20 @@ import java.util.Set;
 import org.bouncycastle.asn1.ASN1Encodable;
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
 import org.bouncycastle.asn1.ASN1OctetString;
+import org.bouncycastle.asn1.cms.CCMParameters;
+import org.bouncycastle.asn1.cms.GCMParameters;
 import org.bouncycastle.asn1.cms.IssuerAndSerialNumber;
 import org.bouncycastle.asn1.cryptopro.CryptoProObjectIdentifiers;
+import org.bouncycastle.asn1.nist.NISTObjectIdentifiers;
 import org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers;
 import org.bouncycastle.asn1.rosstandart.RosstandartObjectIdentifiers;
 import org.bouncycastle.asn1.sec.SECObjectIdentifiers;
+import org.bouncycastle.asn1.x509.AlgorithmIdentifier;
 import org.bouncycastle.asn1.x509.Certificate;
 import org.bouncycastle.asn1.x509.Extension;
 import org.bouncycastle.asn1.x9.X9ObjectIdentifiers;
 import org.bouncycastle.cms.CMSException;
+import org.bouncycastle.cms.CMSTagLengthException;
 import org.bouncycastle.jcajce.util.AlgorithmParametersUtils;
 import org.bouncycastle.jcajce.util.AnnotatedPrivateKey;
 
@@ -29,6 +34,8 @@ class CMSUtils
     private static final Set mqvAlgs = new HashSet();
     private static final Set ecAlgs = new HashSet();
     private static final Set gostAlgs = new HashSet();
+    private static final Set gcmAlgs = new HashSet();
+    private static final Set ccmAlgs = new HashSet();
 
     static
     {
@@ -55,6 +62,14 @@ class CMSUtils
         gostAlgs.add(RosstandartObjectIdentifiers.id_tc26_agreement_gost_3410_12_512);
         gostAlgs.add(RosstandartObjectIdentifiers.id_tc26_gost_3410_12_256);
         gostAlgs.add(RosstandartObjectIdentifiers.id_tc26_gost_3410_12_512);
+
+        gcmAlgs.add(NISTObjectIdentifiers.id_aes128_GCM);
+        gcmAlgs.add(NISTObjectIdentifiers.id_aes192_GCM);
+        gcmAlgs.add(NISTObjectIdentifiers.id_aes256_GCM);
+
+        ccmAlgs.add(NISTObjectIdentifiers.id_aes128_CCM);
+        ccmAlgs.add(NISTObjectIdentifiers.id_aes192_CCM);
+        ccmAlgs.add(NISTObjectIdentifiers.id_aes256_CCM);
     }
 
     static boolean isMQV(ASN1ObjectIdentifier algorithm)
@@ -158,6 +173,61 @@ class CMSUtils
         catch (IOException e)
         {
             throw new CMSException("error encoding algorithm parameters.", e);
+        }
+    }
+
+    /**
+     * Return the length, in octets, of the AEAD authentication tag (ICV) carried by a content-encryption
+     * AlgorithmIdentifier.
+     *
+     * @param contentAlgorithm the content-encryption AlgorithmIdentifier.
+     * @return the tag length in octets, 0 if the AEAD parameters cannot be interpreted, or -1 when the
+     * algorithm is not recognised.
+     */
+    static int getAEADMacLength(AlgorithmIdentifier contentAlgorithm)
+    {
+        ASN1ObjectIdentifier algorithm = contentAlgorithm.getAlgorithm();
+
+        try
+        {
+            if (gcmAlgs.contains(algorithm))
+            {
+                return Math.max(0, GCMParameters.getInstance(contentAlgorithm.getParameters()).getIcvLen());
+            }
+            if (ccmAlgs.contains(algorithm))
+            {
+                return Math.max(0, CCMParameters.getInstance(contentAlgorithm.getParameters()).getIcvLen());
+            }
+        }
+        catch (RuntimeException e)
+        {
+            // malformed or absent AEAD parameters - report no usable tag so a minimum fails closed.
+            return 0;
+        }
+
+        return -1;
+    }
+
+    /**
+     * Refuse an AEAD content algorithm whose authentication tag is shorter than the configured
+     * minimum. A no-op when no minimum is set or when the content algorithm is not AEAD.
+     *
+     * @param minimumTagSizeInBits the minimum acceptable tag size in bits, 0 or less for no minimum.
+     * @param contentAlgorithm the content-encryption AlgorithmIdentifier (carries the AEAD ICV length).
+     * @throws CMSTagLengthException if the tag size is below the configured minimum.
+     */
+    static void checkTagSize(int minimumTagSizeInBits, AlgorithmIdentifier contentAlgorithm)
+        throws CMSTagLengthException
+    {
+        if (minimumTagSizeInBits > 0)
+        {
+            int macLenOctets = getAEADMacLength(contentAlgorithm);
+
+            if (macLenOctets >= 0 && (long)macLenOctets * 8 < minimumTagSizeInBits)
+            {
+                throw new CMSTagLengthException("AEAD tag size " + ((long)macLenOctets * 8)
+                    + " bits below required minimum " + minimumTagSizeInBits + " bits");
+            }
         }
     }
 }
