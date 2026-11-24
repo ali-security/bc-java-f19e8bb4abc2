@@ -2,6 +2,7 @@ package org.bouncycastle.tsp.test;
 
 import java.io.OutputStream;
 import java.math.BigInteger;
+import java.security.MessageDigest;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.PrivateKey;
@@ -20,19 +21,35 @@ import java.util.Set;
 import java.util.SimpleTimeZone;
 
 import junit.framework.TestCase;
+import org.bouncycastle.asn1.ASN1EncodableVector;
 import org.bouncycastle.asn1.ASN1Encoding;
+import org.bouncycastle.asn1.ASN1GeneralizedTime;
+import org.bouncycastle.asn1.ASN1Integer;
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
+import org.bouncycastle.asn1.DERNull;
 import org.bouncycastle.asn1.DEROctetString;
+import org.bouncycastle.asn1.DERSet;
 import org.bouncycastle.asn1.DERUTF8String;
 import org.bouncycastle.asn1.cmp.PKIFailureInfo;
 import org.bouncycastle.asn1.cmp.PKIStatus;
+import org.bouncycastle.asn1.cms.Attribute;
 import org.bouncycastle.asn1.cms.AttributeTable;
+import org.bouncycastle.asn1.cms.Attributes;
+import org.bouncycastle.asn1.cms.CMSAttributes;
+import org.bouncycastle.asn1.cms.CMSObjectIdentifiers;
+import org.bouncycastle.asn1.cms.ContentInfo;
+import org.bouncycastle.asn1.cms.SignedData;
+import org.bouncycastle.asn1.cms.SignerInfo;
+import org.bouncycastle.asn1.cms.Time;
 import org.bouncycastle.asn1.ess.ESSCertID;
 import org.bouncycastle.asn1.ess.ESSCertIDv2;
 import org.bouncycastle.asn1.ess.SigningCertificate;
 import org.bouncycastle.asn1.ess.SigningCertificateV2;
 import org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers;
+import org.bouncycastle.asn1.tsp.MessageImprint;
+import org.bouncycastle.asn1.tsp.TSTInfo;
 import org.bouncycastle.asn1.x500.X500Name;
+import org.bouncycastle.asn1.x509.AlgorithmIdentifier;
 import org.bouncycastle.asn1.x509.ExtendedKeyUsage;
 import org.bouncycastle.asn1.x509.Extension;
 import org.bouncycastle.asn1.x509.Extensions;
@@ -48,7 +65,9 @@ import org.bouncycastle.cert.jcajce.JcaX509CertificateHolder;
 import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder;
 import org.bouncycastle.cms.CMSAttributeTableGenerationException;
 import org.bouncycastle.cms.CMSAttributeTableGenerator;
+import org.bouncycastle.cms.CMSProcessableByteArray;
 import org.bouncycastle.cms.CMSSignedData;
+import org.bouncycastle.cms.CMSSignedDataGenerator;
 import org.bouncycastle.cms.DefaultSignedAttributeTableGenerator;
 import org.bouncycastle.cms.jcajce.JcaSignerInfoGeneratorBuilder;
 import org.bouncycastle.cms.jcajce.JcaSimpleSignerInfoGeneratorBuilder;
@@ -1179,5 +1198,207 @@ public class NewTSPTest
         AttributeTable table = tsToken.getSignedAttributes();
 
         assertNotNull("no signingCertificate attribute found", table.get(PKCSObjectIdentifiers.id_aa_signingCertificate));
+    }
+
+    private static final String TSP_ALLOW_INCONSISTENT_SIGNING_TIME = "org.bouncycastle.tsp.allow_inconsistent_signing_time";
+
+    /**
+     * A signing-time signed attribute is the TSA's own statement of when it signed, as genTime is: a generated
+     * token carries the genTime it was given as its signing-time rather than the clock, and a token in which the
+     * two disagree is rejected on construction (which is what separates a real token from a signature a TSA has
+     * put over an attacker-supplied TSTInfo through some other service that uses the same key).
+     */
+    public void testSigningTimeAgreesWithGenTime()
+        throws Exception
+    {
+        String signDN = "O=Bouncy Castle, C=AU";
+        KeyPair signKP = TSPTestUtil.makeKeyPair();
+        X509Certificate signCert = TSPTestUtil.makeCACertificate(signKP, signDN, signKP, signDN);
+
+        String origDN = "CN=Eric H. Echidna, E=eric@bouncycastle.org, O=Bouncy Castle, C=AU";
+        KeyPair origKP = TSPTestUtil.makeKeyPair();
+        X509Certificate origCert = TSPTestUtil.makeCertificate(origKP, origDN, signKP, signDN);
+
+        List certList = new ArrayList();
+        certList.add(origCert);
+        certList.add(signCert);
+
+        Store certs = new JcaCertStore(certList);
+
+        TimeStampTokenGenerator tsTokenGen = new TimeStampTokenGenerator(
+            new JcaSimpleSignerInfoGeneratorBuilder().build("SHA256withRSA", origKP.getPrivate(), origCert), new SHA256DigestCalculator(), new ASN1ObjectIdentifier("1.2"));
+
+        tsTokenGen.addCertificates(certs);
+        tsTokenGen.setAccuracySeconds(1);
+
+        TimeStampRequestGenerator reqGen = new TimeStampRequestGenerator();
+        TimeStampRequest request = reqGen.generate(TSPAlgorithms.SHA256, new byte[32], BigInteger.valueOf(100));
+
+        TimeStampResponseGenerator tsRespGen = new TimeStampResponseGenerator(tsTokenGen, TSPAlgorithms.ALLOWED);
+
+        // a genTime well away from the clock (but inside the certificate's validity): the generator's signing-time must follow it, not the clock.
+        Date genTime = new Date((System.currentTimeMillis() / 1000) * 1000 + 60 * 60 * 1000L);
+        TimeStampResponse tsResp = tsRespGen.generate(request, new BigInteger("23"), genTime);
+
+        TimeStampToken token = tsResp.getTimeStampToken();
+
+        Attribute signingTimeAttr = token.getSignedAttributes().get(CMSAttributes.signingTime);
+        assertNotNull("no signing-time attribute on generated token", signingTimeAttr);
+        assertEquals(genTime, Time.getInstance(signingTimeAttr.getAttrValues().getObjectAt(0)).getDate());
+        assertEquals(genTime, token.getTimeStampInfo().getGenTime());
+
+        token.validate(new JcaSimpleSignerInfoVerifierBuilder().setProvider(BC).build(origCert));
+
+        // within the accuracy plus allowance is still a consistent token; beyond it is not.
+        assertNotNull(withSigningTime(token, new Date(genTime.getTime() + 60 * 1000L + 1000L)));
+        assertNotNull(withSigningTime(token, new Date(genTime.getTime() - 60 * 1000L - 1000L)));
+
+        Date[] inconsistent = new Date[]{
+            new Date(genTime.getTime() + 60 * 1000L + 2000L),
+            new Date(genTime.getTime() - 60 * 1000L - 2000L),
+            new Date() };
+
+        for (int i = 0; i != inconsistent.length; i++)
+        {
+            try
+            {
+                withSigningTime(token, inconsistent[i]);
+                fail("no exception on inconsistent signing-time " + inconsistent[i]);
+            }
+            catch (TSPValidationException e)
+            {
+                assertEquals("signing-time attribute does not agree with genTime.", e.getMessage());
+            }
+
+            System.setProperty(TSP_ALLOW_INCONSISTENT_SIGNING_TIME, "true");
+            try
+            {
+                assertEquals(inconsistent[i].getTime() / 1000, Time.getInstance(withSigningTime(token, inconsistent[i]).getSignedAttributes().get(CMSAttributes.signingTime).getAttrValues().getObjectAt(0)).getDate().getTime() / 1000);
+            }
+            finally
+            {
+                System.setProperty(TSP_ALLOW_INCONSISTENT_SIGNING_TIME, "false");
+            }
+        }
+    }
+
+    /**
+     * Exploit scenario: the TSA key is also used by a generic CMS signing (countersignature) service. An attacker
+     * submits a TSTInfo carrying a forged genTime as the content to be signed; the service adds its own signing-time
+     * (the clock) and an ESS signing-certificate attribute, producing a correctly signed SignedData of content type
+     * id-ct-TSTInfo. Such a structure must not be accepted as a time-stamp token.
+     */
+    public void testForgedGenTimeFromGenericSignerRejected()
+        throws Exception
+    {
+        String signDN = "O=Bouncy Castle, C=AU";
+        KeyPair signKP = TSPTestUtil.makeKeyPair();
+        X509Certificate signCert = TSPTestUtil.makeCACertificate(signKP, signDN, signKP, signDN);
+
+        String origDN = "CN=Eric H. Echidna, E=eric@bouncycastle.org, O=Bouncy Castle, C=AU";
+        KeyPair origKP = TSPTestUtil.makeKeyPair();
+        X509Certificate origCert = TSPTestUtil.makeCertificate(origKP, origDN, signKP, signDN);
+
+        // attacker-chosen genTime, 30 days away from the actual signing time but inside the certificate validity.
+        Date forgedGenTime = new Date((System.currentTimeMillis() / 1000) * 1000 + 30L * 24 * 60 * 60 * 1000L);
+
+        TSTInfo forgedInfo = new TSTInfo(new ASN1ObjectIdentifier("1.2"),
+            new MessageImprint(new AlgorithmIdentifier(TSPAlgorithms.SHA256, DERNull.INSTANCE), new byte[32]),
+            new ASN1Integer(42), new ASN1GeneralizedTime(forgedGenTime), null, null, null, null, null);
+
+        byte[] certHash = MessageDigest.getInstance("SHA-256").digest(origCert.getEncoded());
+        AttributeTable serviceAttrs = new AttributeTable(new Attribute(PKCSObjectIdentifiers.id_aa_signingCertificateV2,
+            new DERSet(new SigningCertificateV2(new ESSCertIDv2(certHash)))));
+
+        // the generic signing service adds signing-time from its own clock.
+        CMSSignedDataGenerator gen = new CMSSignedDataGenerator();
+        gen.addSignerInfoGenerator(new JcaSimpleSignerInfoGeneratorBuilder().setProvider(BC)
+            .setSignedAttributeGenerator(serviceAttrs).build("SHA256withRSA", origKP.getPrivate(), origCert));
+
+        CMSSignedData forged = gen.generate(new CMSProcessableByteArray(PKCSObjectIdentifiers.id_ct_TSTInfo, forgedInfo.getEncoded(ASN1Encoding.DER)), true);
+
+        assertNotNull("generic signer did not add signing-time",
+            forged.getSignerInfos().getSigners().iterator().next().getSignedAttributes().get(CMSAttributes.signingTime));
+
+        try
+        {
+            TimeStampToken token = new TimeStampToken(forged);
+
+            // without the signing-time check this forged token would validate against the TSA certificate.
+            token.validate(new JcaSimpleSignerInfoVerifierBuilder().setProvider(BC).build(origCert));
+            fail("forged genTime accepted: " + token.getTimeStampInfo().getGenTime());
+        }
+        catch (TSPValidationException e)
+        {
+            assertEquals("signing-time attribute does not agree with genTime.", e.getMessage());
+        }
+
+        // also rejected when re-parsed from its encoding.
+        try
+        {
+            new TimeStampToken(new CMSSignedData(forged.getEncoded()));
+            fail("forged genTime accepted on re-parse");
+        }
+        catch (TSPValidationException e)
+        {
+            assertEquals("signing-time attribute does not agree with genTime.", e.getMessage());
+        }
+
+        // the override restores the previous, permissive behaviour.
+        System.setProperty(TSP_ALLOW_INCONSISTENT_SIGNING_TIME, "true");
+        try
+        {
+            TimeStampToken token = new TimeStampToken(forged);
+
+            token.validate(new JcaSimpleSignerInfoVerifierBuilder().setProvider(BC).build(origCert));
+            assertEquals(forgedGenTime, token.getTimeStampInfo().getGenTime());
+        }
+        finally
+        {
+            System.setProperty(TSP_ALLOW_INCONSISTENT_SIGNING_TIME, "false");
+        }
+    }
+
+    /**
+     * Rewrite the token's single SignerInfo with the given signing-time (the signature is left as is, the
+     * construction-time checks do not depend on it).
+     */
+    private TimeStampToken withSigningTime(TimeStampToken token, Date signingTime)
+        throws Exception
+    {
+        SignedData signedData = SignedData.getInstance(token.toCMSSignedData().toASN1Structure().getContent());
+
+        SignerInfo signerInfo = SignerInfo.getInstance(signedData.getSignerInfos().getObjectAt(0));
+
+        ASN1EncodableVector rebuilt = new ASN1EncodableVector();
+        Attribute[] attrArr = Attributes.getInstance(signerInfo.getAuthenticatedAttributes()).getAttributes();
+        for (int i = 0; i != attrArr.length; i++)
+        {
+            if (attrArr[i].getAttrType().equals(CMSAttributes.signingTime))
+            {
+                rebuilt.add(new Attribute(CMSAttributes.signingTime, new DERSet(new Time(signingTime))));
+            }
+            else
+            {
+                rebuilt.add(attrArr[i]);
+            }
+        }
+
+        SignerInfo rewritten = new SignerInfo(
+            signerInfo.getSID(),
+            signerInfo.getDigestAlgorithm(),
+            new Attributes(rebuilt),
+            signerInfo.getDigestEncryptionAlgorithm(),
+            signerInfo.getEncryptedDigest(),
+            signerInfo.getUnauthenticatedAttributes() == null ? null : Attributes.getInstance(signerInfo.getUnauthenticatedAttributes()));
+
+        SignedData rewrittenSignedData = new SignedData(
+            signedData.getDigestAlgorithms(),
+            signedData.getEncapContentInfo(),
+            signedData.getCertificates(),
+            signedData.getCRLs(),
+            new DERSet(rewritten));
+
+        return new TimeStampToken(new ContentInfo(CMSObjectIdentifiers.signedData, rewrittenSignedData));
     }
 }

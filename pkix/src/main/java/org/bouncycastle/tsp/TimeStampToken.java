@@ -10,8 +10,10 @@ import org.bouncycastle.asn1.ASN1Encoding;
 import org.bouncycastle.asn1.ASN1Primitive;
 import org.bouncycastle.asn1.cms.Attribute;
 import org.bouncycastle.asn1.cms.AttributeTable;
+import org.bouncycastle.asn1.cms.CMSAttributes;
 import org.bouncycastle.asn1.cms.ContentInfo;
 import org.bouncycastle.asn1.cms.IssuerAndSerialNumber;
+import org.bouncycastle.asn1.cms.Time;
 import org.bouncycastle.asn1.ess.ESSCertID;
 import org.bouncycastle.asn1.ess.ESSCertIDv2;
 import org.bouncycastle.asn1.ess.SigningCertificate;
@@ -35,13 +37,31 @@ import org.bouncycastle.cms.SignerInformationVerifier;
 import org.bouncycastle.operator.DigestCalculator;
 import org.bouncycastle.operator.OperatorCreationException;
 import org.bouncycastle.util.Arrays;
+import org.bouncycastle.util.Properties;
 import org.bouncycastle.util.Store;
 
 /**
  * Carrier class for a TimeStampToken.
+ * <p>
+ * Construction checks the token's structure: the content type is id-ct-TSTInfo, there is exactly one
+ * signer, a signing-certificate signed attribute is present, and a signing-time signed attribute, if
+ * present, agrees with the TSTInfo genTime to within the token's accuracy (plus a one minute allowance).
+ * The last of these is what distinguishes an RFC 3161 token from a signature a TSA has produced over
+ * an attacker-supplied TSTInfo through some other service that uses the same key, such as a legacy
+ * countersignature endpoint - the TSA sets signing-time itself, so it cannot be moved to match a forged
+ * genTime. The check can be disabled by setting the property "org.bouncycastle.tsp.allow_inconsistent_signing_time"
+ * to "true".
  */
 public class TimeStampToken
 {
+    /**
+     * Whether a time-stamp token whose signing-time signed attribute disagrees with the genTime of its
+     * TSTInfo is accepted. Default false. Read via {@link Properties#isOverrideSet(String)}.
+     */
+    private static final String TSP_ALLOW_INCONSISTENT_SIGNING_TIME = "org.bouncycastle.tsp.allow_inconsistent_signing_time";
+
+    private static final long SIGNING_TIME_ALLOWANCE = 60 * 1000L;
+
     CMSSignedData tsToken;
 
     SignerInformation tsaSignerInfo;
@@ -122,10 +142,49 @@ public class TimeStampToken
 
                 this.certID = new CertID(ESSCertIDv2.getInstance(signCertV2.getCerts()[0]));
             }
+
+            checkSigningTime(tsaSignerInfo.getSignedAttributes());
         }
         catch (CMSException e)
         {
             throw new TSPException(e.getMessage(), e.getUnderlyingException());
+        }
+    }
+
+    /**
+     * A signing-time signed attribute (RFC 5652 sec. 11.3) on a time-stamp token is, like genTime, the TSA's
+     * statement of when it produced the token; a token in which the two disagree was not produced as RFC 3161
+     * describes and is rejected unless the "org.bouncycastle.tsp.allow_inconsistent_signing_time" property is set.
+     */
+    private void checkSigningTime(AttributeTable signedAttr)
+        throws TSPValidationException
+    {
+        Attribute attr = signedAttr.get(CMSAttributes.signingTime);
+
+        if (attr == null || Properties.isOverrideSet(TSP_ALLOW_INCONSISTENT_SIGNING_TIME))
+        {
+            return;
+        }
+
+        if (attr.getAttrValues().size() != 1)
+        {
+            throw new TSPValidationException("signing-time attribute MUST contain exactly one value.");
+        }
+
+        Date signingTime = Time.getInstance(attr.getAttrValues().getObjectAt(0)).getDate();
+        Date genTime = tstInfo.getGenTime();
+
+        long allowance = SIGNING_TIME_ALLOWANCE;
+        GenTimeAccuracy accuracy = tstInfo.getGenTimeAccuracy();
+        if (accuracy != null)
+        {
+            allowance += accuracy.getSeconds() * 1000L + accuracy.getMillis() + 1;
+        }
+
+        long difference = signingTime.getTime() - genTime.getTime();
+        if (difference > allowance || difference < -allowance)
+        {
+            throw new TSPValidationException("signing-time attribute does not agree with genTime.");
         }
     }
 
